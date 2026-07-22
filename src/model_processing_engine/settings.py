@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 from dataclasses import dataclass
@@ -8,8 +9,8 @@ from pathlib import Path
 from .exceptions import ConfigurationError
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_PROVIDER_CONFIG = Path(__file__).with_name("default_providers.json")
+DEFAULT_RUNTIME_DIRECTORY = ".model-processing-engine"
 
 
 @dataclass(frozen=True)
@@ -23,14 +24,33 @@ class Settings:
     max_provider_concurrency: int
     max_request_bytes: int
     api_token: str = ""
+    log_dir: Path | None = None
+    run_dir: Path | None = None
 
     @property
     def database_path(self) -> Path:
         return self.data_dir / "runtime.sqlite"
 
+    @property
+    def service_log_path(self) -> Path:
+        return (self.log_dir or self.root / "logs") / "service.log"
+
+    @property
+    def service_record_path(self) -> Path:
+        return (self.run_dir or self.root / "run") / "service.json"
+
+    @property
+    def service_lock_path(self) -> Path:
+        return (self.run_dir or self.root / "run") / "manager.lock"
+
+    @property
+    def instance_id(self) -> str:
+        source = str(self.root.resolve()).encode("utf-8")
+        return hashlib.sha256(source).hexdigest()[:16]
+
 
 def load_settings(root: str | Path | None = None) -> Settings:
-    resolved_root = Path(root or PROJECT_ROOT).expanduser().resolve()
+    resolved_root = _runtime_root(root)
     configured_provider_path = os.environ.get("MPE_PROVIDER_CONFIG")
     repository_provider_config = resolved_root / "config" / "providers.json"
     provider_config = (
@@ -42,6 +62,14 @@ def load_settings(root: str | Path | None = None) -> Settings:
     )
     data_dir = _resolved_path(
         os.environ.get("MPE_DATA_DIR", "data/runtime"),
+        root=resolved_root,
+    )
+    log_dir = _resolved_path(
+        os.environ.get("MPE_LOG_DIR", "logs"),
+        root=resolved_root,
+    )
+    run_dir = _resolved_path(
+        os.environ.get("MPE_RUN_DIR", "run"),
         root=resolved_root,
     )
     host = os.environ.get("MPE_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -76,7 +104,21 @@ def load_settings(root: str | Path | None = None) -> Settings:
         max_provider_concurrency=max_concurrency,
         max_request_bytes=max_request_bytes,
         api_token=api_token,
+        log_dir=log_dir,
+        run_dir=run_dir,
     )
+
+
+def _runtime_root(root: str | Path | None) -> Path:
+    if root is not None:
+        return Path(root).expanduser().resolve()
+    configured = os.environ.get("MPE_HOME", "").strip()
+    base = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / DEFAULT_RUNTIME_DIRECTORY
+    )
+    return base.resolve()
 
 
 def _resolved_path(value: str, *, root: Path) -> Path:

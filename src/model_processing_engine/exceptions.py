@@ -19,3 +19,7 @@ class ConfigurationError(ModelProcessingError):
 
 class ExecutionNotFoundError(ModelProcessingError):
     """An execution record does not exist."""
+
+
+class ServiceManagerError(ModelProcessingError):
+    """The managed local service could not be controlled safely."""

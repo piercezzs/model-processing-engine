@@ -94,6 +94,29 @@ class ServiceAndCliTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 200)
 
+    def test_remote_mode_protects_health_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(root)
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="0.0.0.0",
+                port=8787,
+                allow_remote=True,
+                max_provider_concurrency=8,
+                max_request_bytes=2 * 1024 * 1024,
+                api_token="remote-secret",
+            )
+            client = TestClient(create_app(engine=engine, settings=settings))
+            self.assertEqual(client.get("/v1/health").status_code, 401)
+            response = client.get(
+                "/v1/health",
+                headers={"Authorization": "Bearer remote-secret"},
+            )
+            self.assertEqual(response.status_code, 200)
+
     def test_cli_validates_example_task(self) -> None:
         task_dir = Path(__file__).parents[1] / "examples" / "tasks" / "generic_summary"
         stdout = io.StringIO()
@@ -117,6 +140,56 @@ class ServiceAndCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             app = run.call_args.args[0]
             self.assertEqual(app.state.settings.root, root.resolve())
+
+    def test_health_identifies_runtime_and_api_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(root)
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="127.0.0.1",
+                port=8787,
+                allow_remote=False,
+                max_provider_concurrency=8,
+                max_request_bytes=2 * 1024 * 1024,
+            )
+            client = TestClient(create_app(engine=engine, settings=settings))
+            health = client.get("/v1/health").json()
+            self.assertEqual(health["app"], "model-processing-engine")
+            self.assertEqual(health["apiVersion"], "v1")
+            self.assertEqual(health["instanceId"], settings.instance_id)
+            self.assertGreater(health["processId"], 0)
+
+    def test_provider_endpoint_includes_configured_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(root)
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="127.0.0.1",
+                port=8787,
+                allow_remote=False,
+                max_provider_concurrency=8,
+                max_request_bytes=2 * 1024 * 1024,
+            )
+            client = TestClient(create_app(engine=engine, settings=settings))
+            payload = client.get("/v1/providers").json()
+            self.assertEqual(payload["providers"], ["mock"])
+            self.assertEqual(payload["providerDetails"][0]["id"], "mock")
+
+    def test_cli_status_prints_manager_result(self) -> None:
+        stdout = io.StringIO()
+        with patch(
+            "model_processing_engine.cli.service_status",
+            return_value={"status": "stopped"},
+        ), redirect_stdout(stdout):
+            code = main(["status", "--root", "/tmp/mpe-test-root"])
+        self.assertEqual(code, 0)
+        self.assertIn('"status": "stopped"', stdout.getvalue())
 
 
 if __name__ == "__main__":

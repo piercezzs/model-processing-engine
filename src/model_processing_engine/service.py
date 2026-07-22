@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hmac
+import os
 import threading
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 
 from .contracts import ExecutionRequest
+from .constants import API_VERSION, APP_ID, VERSION
 from .engine import ModelProcessingEngine
 from .exceptions import ExecutionNotFoundError
 from .factory import build_default_engine
@@ -22,7 +24,7 @@ def create_app(
     task_engine = engine or build_default_engine(settings=runtime, recover_incomplete=True)
     app = FastAPI(
         title="Model Processing Engine",
-        version="0.1.0",
+        version=VERSION,
         description="Business-neutral runtime for externally defined model tasks.",
     )
     background_threads: set[threading.Thread] = set()
@@ -42,31 +44,37 @@ def create_app(
 
     @app.middleware("http")
     async def enforce_api_token(request: Request, call_next: Any) -> Response:
-        if runtime.api_token and request.url.path != "/v1/health":
+        health_path = f"/{API_VERSION}/health"
+        health_is_public = request.url.path == health_path and not runtime.allow_remote
+        if runtime.api_token and not health_is_public:
             supplied = request.headers.get("authorization", "")
             expected = f"Bearer {runtime.api_token}"
             if not hmac.compare_digest(supplied, expected):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
 
-    @app.get("/v1/health")
+    @app.get(f"/{API_VERSION}/health")
     def health() -> dict[str, Any]:
         return {
             "status": "ok",
-            "app": "model-processing-engine",
-            "version": "0.1.0",
+            "app": APP_ID,
+            "version": VERSION,
+            "apiVersion": API_VERSION,
+            "instanceId": runtime.instance_id,
+            "processId": os.getpid(),
             "providers": task_engine.providers.ids(),
             "cacheEntries": task_engine.store.cache_count(),
         }
 
-    @app.get("/v1/providers")
+    @app.get(f"/{API_VERSION}/providers")
     def providers() -> dict[str, Any]:
         return {
             "providers": task_engine.providers.ids(),
+            "providerDetails": task_engine.providers.descriptors(),
             "defaultProviderId": task_engine.providers.default_provider_id,
         }
 
-    @app.post("/v1/executions")
+    @app.post(f"/{API_VERSION}/executions")
     def execute(request: ExecutionRequest) -> dict[str, Any]:
         if not request.async_mode:
             return task_engine.execute(request).model_dump(by_alias=True)
@@ -89,14 +97,14 @@ def create_app(
         thread.start()
         return reserved.model_dump(by_alias=True)
 
-    @app.get("/v1/executions/{execution_id}")
+    @app.get(f"/{API_VERSION}/executions/{{execution_id}}")
     def execution(execution_id: str) -> dict[str, Any]:
         try:
             return task_engine.get_execution(execution_id).model_dump(by_alias=True)
         except ExecutionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/v1/cache/cleanup")
+    @app.post(f"/{API_VERSION}/cache/cleanup")
     def cleanup_cache() -> dict[str, int]:
         return {"removed": task_engine.store.cleanup_expired()}
 

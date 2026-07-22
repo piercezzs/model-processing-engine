@@ -5,7 +5,9 @@
     "mock": {
       "type": "mock",
       "defaultModel": "schema-sample-v1",
-      "cacheIdentity": "mock-v1"
+      "cacheIdentity": "mock-v1",
+      "availableModels": ["schema-sample-v1"],
+      "capabilities": ["structured_json"]
     }
   }
 }

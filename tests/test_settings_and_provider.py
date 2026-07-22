@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from model_processing_engine.exceptions import ConfigurationError
-from model_processing_engine.providers.base import ProviderConfig
+from model_processing_engine.providers.base import ProviderConfig, ProviderRegistry
 from model_processing_engine.providers.openai_compatible import OpenAICompatibleProvider
 from model_processing_engine.settings import PACKAGE_PROVIDER_CONFIG, load_settings
 
@@ -28,6 +28,15 @@ class _Response:
 
 
 class SettingsAndProviderTests(unittest.TestCase):
+    def test_default_runtime_root_uses_mpe_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {"MPE_HOME": temp_dir}, clear=True):
+                settings = load_settings()
+            self.assertEqual(settings.root, Path(temp_dir).resolve())
+            self.assertEqual(settings.log_dir, settings.root / "logs")
+            self.assertEqual(settings.run_dir, settings.root / "run")
+            self.assertEqual(len(settings.instance_id), 16)
+
     def test_installed_mode_uses_packaged_mock_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
             settings = load_settings(temp_dir)
@@ -124,6 +133,22 @@ class SettingsAndProviderTests(unittest.TestCase):
             cache_identity="account-two",
         )
         self.assertNotEqual(first.digest, second.digest)
+
+    def test_provider_descriptor_exposes_models_without_secrets(self) -> None:
+        config = ProviderConfig(
+            id="test",
+            type="openai_compatible",
+            default_model="model-one",
+            base_url="https://example.invalid/v1",
+            api_key_env="SECRET_KEY",
+            available_models=("model-one",),
+            capabilities=("structured_json",),
+        )
+        provider = OpenAICompatibleProvider(config)
+        registry = ProviderRegistry({"test": provider}, default_provider_id="test")
+        descriptor = registry.descriptors()[0]
+        self.assertEqual(descriptor["availableModels"], ["model-one"])
+        self.assertNotIn("apiKeyEnv", descriptor)
 
 
 if __name__ == "__main__":

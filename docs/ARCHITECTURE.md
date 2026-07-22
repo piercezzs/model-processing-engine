@@ -56,6 +56,27 @@ Provider secrets are also environment-only. Task schemas may use internal JSON
 Schema fragments, but external references are rejected to prevent validation
 from retrieving untrusted resources.
 
+## Managed Service Lifecycle
+
+`mpe start`, `stop`, `status`, and `restart` treat the runtime root as a service
+identity. The default root is `~/.model-processing-engine`; explicit roots form
+isolated runtime profiles. Data, logs, and process-control records have separate
+subdirectories and environment overrides.
+
+The manager serializes control operations with an exclusive short-lived lock.
+The service record is written atomically with owner-only permissions. Startup
+waits for health that matches the application ID, API version, runtime instance
+digest, and spawned process ID. Stop sends signals only after the same checks;
+foreign listeners and unverified live PIDs fail closed.
+
+The foreground service also holds an operating-system file lock inside its data
+directory for its full lifetime. This makes the one-service-per-data-directory
+rule machine-enforced even when separate runtime roots or ports are configured.
+
+The HTTP path version comes from one runtime constant. Provider capability and
+configured-model declarations are exposed without credential environment names
+or secret values.
+
 ## Complexity Gate
 
 The service is L3: it exposes a local network interface, accepts external input,

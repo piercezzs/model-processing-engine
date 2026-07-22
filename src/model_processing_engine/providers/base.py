@@ -21,6 +21,8 @@ class ProviderConfig:
     timeout_seconds: int = 60
     transport_retries: int = 2
     cache_identity: str = "1"
+    available_models: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ("structured_json",)
 
     @property
     def identity(self) -> dict[str, Any]:
@@ -82,6 +84,18 @@ class ProviderRegistry:
     def ids(self) -> list[str]:
         return sorted(self._providers)
 
+    def descriptors(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": provider.config.id,
+                "type": provider.config.type,
+                "defaultModel": provider.config.default_model,
+                "availableModels": list(provider.config.available_models),
+                "capabilities": list(provider.config.capabilities),
+            }
+            for provider in (self._providers[provider_id] for provider_id in self.ids())
+        ]
+
 
 def load_provider_registry(
     config_path: str | Path,
@@ -123,14 +137,40 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         raise ConfigurationError(f"Provider {provider_id} timeoutSeconds must be 1-600")
     if not 0 <= retries <= 5:
         raise ConfigurationError(f"Provider {provider_id} transportRetries must be 0-5")
+    available_models = _string_tuple(
+        value.get("availableModels", []),
+        label="availableModels",
+    )
+    capabilities = _string_tuple(
+        value.get("capabilities", ["structured_json"]),
+        label="capabilities",
+    )
+    default_model = str(value.get("defaultModel") or "").strip()
+    if available_models and default_model and default_model not in available_models:
+        raise ConfigurationError(
+            f"Provider {provider_id} defaultModel must appear in availableModels"
+        )
     return ProviderConfig(
         id=provider_id,
         type=provider_type,
-        default_model=str(value.get("defaultModel") or "").strip(),
+        default_model=default_model,
         base_url=base_url,
         chat_completions_path=str(value.get("chatCompletionsPath") or "/chat/completions"),
         api_key_env=str(value.get("apiKeyEnv") or "").strip(),
         timeout_seconds=timeout,
         transport_retries=retries,
         cache_identity=str(value.get("cacheIdentity") or "1").strip(),
+        available_models=available_models,
+        capabilities=capabilities,
     )
+
+
+def _string_tuple(value: Any, *, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ConfigurationError(f"Provider {label} must be an array")
+    normalized = tuple(str(item).strip() for item in value)
+    if any(not item for item in normalized):
+        raise ConfigurationError(f"Provider {label} must not contain empty values")
+    if len(set(normalized)) != len(normalized):
+        raise ConfigurationError(f"Provider {label} must not contain duplicates")
+    return normalized

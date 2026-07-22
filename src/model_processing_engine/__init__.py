@@ -1,5 +1,6 @@
 """Business-neutral model task runtime."""
 
+from .constants import VERSION
 from .contracts import ExecutionRequest, ResultEnvelope, TaskDefinition
 from .engine import ModelProcessingEngine
 from .factory import build_default_engine
@@ -14,4 +15,4 @@ __all__ = [
     "load_task_pack",
 ]
 
-__version__ = "0.1.0"
+__version__ = VERSION

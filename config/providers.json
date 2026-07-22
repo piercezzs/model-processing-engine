@@ -5,7 +5,9 @@
     "mock": {
       "type": "mock",
       "defaultModel": "schema-sample-v1",
-      "cacheIdentity": "mock-v1"
+      "cacheIdentity": "mock-v1",
+      "availableModels": ["schema-sample-v1"],
+      "capabilities": ["structured_json"]
     },
     "openai-compatible": {
       "type": "openai_compatible",
@@ -15,7 +17,9 @@
       "defaultModel": "",
       "timeoutSeconds": 60,
       "transportRetries": 2,
-      "cacheIdentity": "account-and-endpoint-v1"
+      "cacheIdentity": "account-and-endpoint-v1",
+      "availableModels": [],
+      "capabilities": ["structured_json"]
     }
   }
 }

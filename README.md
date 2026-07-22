@@ -38,6 +38,10 @@ The bundled default provider is deterministic `mock`; it makes the repository
 runnable without network access or credentials. Copy `config/providers.json` to
 your deployment configuration and set `MPE_PROVIDER_CONFIG` before real calls.
 
+`MPE_HOME` defaults to `~/.model-processing-engine`. Managed-service data, logs,
+and process records live below that stable root unless their individual paths
+are overridden. An explicit `--root` selects a separate runtime profile.
+
 ## Task Pack
 
 A Task Pack is owned and versioned by the calling project:
@@ -147,11 +151,35 @@ The caller should persist `result.result` only after checking
 
 ## HTTP service
 
-Start the loopback service:
+Start a managed background service using the stable default runtime root:
+
+```bash
+.venv/bin/mpe start
+.venv/bin/mpe status
+.venv/bin/mpe restart
+.venv/bin/mpe stop
+```
+
+Use an explicit runtime profile when isolation is required:
+
+```bash
+.venv/bin/mpe start --root /path/to/runtime-profile
+```
+
+For foreground development and diagnostics:
 
 ```bash
 .venv/bin/mpe serve --root .
 ```
+
+Managed startup is idempotent. It writes a restricted service record and log,
+waits for verified health, and rejects a conflicting listener. Stop verifies the
+application ID, runtime instance ID, and process ID before signaling a process;
+an unverified live PID is never terminated.
+
+`status` reports `running`, `stopped`, `stale`, `unresponsive`, `conflict`, or
+`running_unmanaged`. A foreground `serve` process is intentionally unmanaged and
+must be stopped by its owning terminal.
 
 Available routes:
 
@@ -168,12 +196,16 @@ the execution route.
 
 The default host is `127.0.0.1`. Non-loopback binding requires both
 `MPE_ALLOW_REMOTE=1` and `MPE_API_TOKEN`; authenticated routes then require
-`Authorization: Bearer <token>`. Health remains available without a token.
-Use a reverse proxy with TLS if the service crosses a trusted machine boundary.
+`Authorization: Bearer <token>`. Health remains public only for loopback
+deployments. Use a reverse proxy with TLS if the service crosses a trusted
+machine boundary.
 
 Use one service process per `MPE_DATA_DIR`. Service startup marks queued or
 running records from the previous runtime as interrupted. Separate callers may
 share a service, but separate service processes should use separate data paths.
+
+Health includes the application version, API version, stable runtime instance
+ID, and process ID so local service management can verify process identity.
 
 ## Provider configuration
 
@@ -182,6 +214,10 @@ share a service, but separate service processes should use separate data paths.
 - `mock`: deterministic schema-derived output for tests and integration setup.
 - `openai_compatible`: JSON chat-completions transport with bounded retry for
   rate-limit, server, timeout, and connection failures.
+
+Provider configuration may declare `availableModels` and `capabilities`. The
+`/v1/providers` response exposes those non-secret declarations while preserving
+the original provider-ID list for compatibility.
 
 Credentials are referenced by environment-variable name in provider config.
 They must never be placed in Task Packs, request payloads, or committed files.
@@ -194,6 +230,7 @@ when that context changes; the value participates in technical cache identity.
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m compileall -q src tests
 .venv/bin/mpe task validate --task-dir examples/tasks/generic_summary
+.venv/bin/mpe status --root /tmp/mpe-verification-profile
 ```
 
 The automated suite uses only the mock provider or mocked transports. A real

@@ -4,10 +4,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from .contracts import ExecutionRequest
+from .exceptions import ModelProcessingError
 from .factory import build_default_engine
+from .process_manager import restart_service, service_status, start_service, stop_service
+from .runtime_lock import exclusive_runtime_lock
 from .settings import load_settings
 from .task_loader import load_task_pack
 
@@ -17,6 +20,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")
     parser = _parser()
     args = parser.parse_args(argv)
+    try:
+        return _run(args)
+    except ModelProcessingError as exc:
+        _print_json(
+            {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"},
+            stream=sys.stderr,
+        )
+        return 1
+
+
+def _run(args: argparse.Namespace) -> int:
     if args.command == "task" and args.task_command == "validate":
         task = load_task_pack(args.task_dir)
         _print_json(
@@ -57,12 +71,25 @@ def main(argv: list[str] | None = None) -> int:
         from .service import create_app
 
         settings = load_settings(args.root)
-        uvicorn.run(
-            create_app(settings=settings),
-            host=settings.host,
-            port=settings.port,
-            reload=False,
-        )
+        with exclusive_runtime_lock(settings):
+            uvicorn.run(
+                create_app(settings=settings),
+                host=settings.host,
+                port=settings.port,
+                reload=False,
+            )
+        return 0
+    if args.command == "start":
+        _print_json(start_service(load_settings(args.root), timeout_seconds=args.timeout))
+        return 0
+    if args.command == "stop":
+        _print_json(stop_service(load_settings(args.root), timeout_seconds=args.timeout))
+        return 0
+    if args.command == "restart":
+        _print_json(restart_service(load_settings(args.root), timeout_seconds=args.timeout))
+        return 0
+    if args.command == "status":
+        _print_json(service_status(load_settings(args.root)))
         return 0
     parser.error("Unknown command")
     return 2
@@ -83,15 +110,27 @@ def _parser() -> argparse.ArgumentParser:
     execute.add_argument("--provider")
     execute.add_argument("--model")
     execute.add_argument("--force-refresh", action="store_true")
-    execute.add_argument("--root", default=".")
+    execute.add_argument("--root")
 
     cache_parser = subparsers.add_parser("cache", help="Cache maintenance")
     cache_subparsers = cache_parser.add_subparsers(dest="cache_command", required=True)
     cleanup = cache_subparsers.add_parser("cleanup", help="Remove expired entries")
-    cleanup.add_argument("--root", default=".")
+    cleanup.add_argument("--root")
 
     serve = subparsers.add_parser("serve", help="Start the loopback HTTP service")
-    serve.add_argument("--root", default=".")
+    serve.add_argument("--root")
+
+    for command, help_text in (
+        ("start", "Start the managed background service"),
+        ("stop", "Stop the managed background service"),
+        ("restart", "Restart the managed background service"),
+    ):
+        service_command = subparsers.add_parser(command, help=help_text)
+        service_command.add_argument("--root")
+        service_command.add_argument("--timeout", type=float, default=15.0)
+
+    status = subparsers.add_parser("status", help="Inspect the local service state")
+    status.add_argument("--root")
     return parser
 
 
@@ -102,8 +141,8 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _print_json(value: Any) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2))
+def _print_json(value: Any, *, stream: TextIO | None = None) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2), file=stream or sys.stdout)
 
 
 if __name__ == "__main__":
