@@ -7,16 +7,26 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
-from model_processing_engine.exceptions import ConfigurationError, ProviderError
+from model_processing_engine.exceptions import (
+    ConfigurationError,
+    ProviderEmptyContentError,
+    ProviderError,
+)
 
 from .base import ProviderCallResult, ProviderConfig
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        credential_resolver: Callable[[str], str] | None = None,
+    ) -> None:
         self.config = config
+        self._credential_resolver = credential_resolver or _environment_credential
 
     def call_json(
         self,
@@ -27,9 +37,10 @@ class OpenAICompatibleProvider:
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        extra_body: dict[str, Any] | None = None,
     ) -> ProviderCallResult:
         del output_schema
-        api_key = os.environ.get(self.config.api_key_env, "").strip()
+        api_key = self._credential_resolver(self.config.api_key_env).strip()
         if not self.config.api_key_env or not api_key:
             raise ConfigurationError(
                 f"Missing provider credential environment variable: {self.config.api_key_env or '<unset>'}"
@@ -48,6 +59,15 @@ class OpenAICompatibleProvider:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if extra_body:
+            protected = {"model", "messages", "temperature", "response_format", "max_tokens"}
+            collisions = protected.intersection(extra_body)
+            if collisions:
+                raise ConfigurationError(
+                    "Provider request options cannot override protected fields: "
+                    + ", ".join(sorted(collisions))
+                )
+            payload.update(extra_body)
         request = urllib.request.Request(
             self._url(),
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -69,15 +89,61 @@ class OpenAICompatibleProvider:
             elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
         )
 
+    def list_models(self, *, models_path: str = "/models") -> dict[str, Any]:
+        api_key = self._credential_resolver(self.config.api_key_env).strip()
+        if not self.config.api_key_env or not api_key:
+            raise ConfigurationError(
+                f"Missing provider credential environment variable: {self.config.api_key_env or '<unset>'}"
+            )
+        request = urllib.request.Request(
+            self._url_for(models_path),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": "model-processing-engine/0.1",
+            },
+            method="GET",
+        )
+        started = time.perf_counter()
+        response, attempts = self._request_json(request)
+        data = response.get("data")
+        if not isinstance(data, list):
+            raise ProviderError("Provider model list has no data array")
+        models: list[str] = []
+        seen: set[str] = set()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            if not model_id or len(model_id) > 256 or model_id in seen:
+                continue
+            seen.add(model_id)
+            models.append(model_id)
+            if len(models) >= 512:
+                break
+        if not models:
+            raise ProviderError("Provider returned no usable model IDs")
+        return {
+            "models": models,
+            "attempts": attempts,
+            "elapsedMs": max(0, int((time.perf_counter() - started) * 1000)),
+        }
+
     def _url(self) -> str:
-        return self.config.base_url.rstrip("/") + "/" + self.config.chat_completions_path.lstrip("/")
+        return self._url_for(self.config.chat_completions_path)
+
+    def _url_for(self, path: str) -> str:
+        return self.config.base_url.rstrip("/") + "/" + path.lstrip("/")
 
     def _request_json(self, request: urllib.request.Request) -> tuple[dict[str, Any], int]:
         attempts = self.config.transport_retries + 1
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                with _open_without_redirects(
+                    request,
+                    timeout=self.config.timeout_seconds,
+                ) as response:
                     body = response.read().decode("utf-8")
             except urllib.error.HTTPError as exc:
                 try:
@@ -118,7 +184,7 @@ def _message_content(payload: dict[str, Any]) -> str:
         raise ProviderError("Provider response has no message")
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise ProviderError("Provider response content is empty")
+        raise ProviderEmptyContentError("Provider response content is empty")
     return content.strip()
 
 
@@ -180,5 +246,28 @@ def _retryable_errors() -> tuple[type[Exception], ...]:
     )
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def _open_without_redirects(request: urllib.request.Request, *, timeout: int) -> Any:
+    opener = urllib.request.build_opener(_RejectRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
 def _preview(value: str) -> str:
     return " ".join(value.split())[:300] or "<empty>"
+
+
+def _environment_credential(name: str) -> str:
+    return os.environ.get(name, "") if name else ""

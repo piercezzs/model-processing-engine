@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import threading
+import time
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from .exceptions import ConfigurationError, ProviderEmptyContentError
+from .file_store import atomic_write_text
+from .project_environment import read_env_file, update_project_environment
+from .providers.base import ProviderConfig, load_provider_registry_data
+from .providers.mock import MockProvider
+from .providers.openai_compatible import OpenAICompatibleProvider
+
+
+PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+TEST_TOKEN_TTL_SECONDS = 300
+MAX_PROVIDER_CONFIG_BYTES = 256 * 1024
+ProviderPresetId = Literal["openai", "deepseek", "custom", "mock"]
+
+PROVIDER_PRESETS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "type": "openai_compatible",
+        "providerId": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "chatCompletionsPath": "/chat/completions",
+        "modelsPath": "/models",
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "type": "openai_compatible",
+        "providerId": "deepseek",
+        "baseUrl": "https://api.deepseek.com",
+        "chatCompletionsPath": "/chat/completions",
+        "modelsPath": "/models",
+    },
+    {
+        "id": "custom",
+        "label": "自定义 OpenAI-compatible",
+        "type": "openai_compatible",
+        "providerId": "custom-provider",
+        "baseUrl": "",
+        "chatCompletionsPath": "/chat/completions",
+        "modelsPath": "/models",
+    },
+    {
+        "id": "mock",
+        "label": "Mock（离线测试）",
+        "type": "mock",
+        "providerId": "mock",
+        "baseUrl": "",
+        "chatCompletionsPath": "/chat/completions",
+        "modelsPath": "/models",
+    },
+)
+
+
+class ProviderConnectionDraft(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    provider_id: str = Field(alias="providerId", min_length=1, max_length=64)
+    type: Literal["mock", "openai_compatible"]
+    preset_id: ProviderPresetId = Field(default="custom", alias="presetId")
+    base_url: str = Field(default="", alias="baseUrl", max_length=2048)
+    chat_completions_path: str = Field(
+        default="/chat/completions",
+        alias="chatCompletionsPath",
+        max_length=512,
+    )
+    models_path: str = Field(default="/models", alias="modelsPath", max_length=512)
+    api_key: SecretStr | None = Field(default=None, alias="apiKey", max_length=16_384)
+    timeout_seconds: int = Field(default=60, alias="timeoutSeconds", ge=1, le=600)
+    transport_retries: int = Field(default=2, alias="transportRetries", ge=0, le=5)
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not PROVIDER_ID_PATTERN.fullmatch(normalized):
+            raise ValueError("providerId contains unsupported characters")
+        return normalized
+
+    @field_validator("base_url", "chat_completions_path", "models_path")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self) -> "ProviderConnectionDraft":
+        preset = next((item for item in PROVIDER_PRESETS if item["id"] == self.preset_id), None)
+        if preset and self.preset_id != "custom" and preset["type"] != self.type:
+            raise ValueError("presetId does not match the selected provider type")
+        if self.type == "openai_compatible":
+            if not self.base_url:
+                raise ValueError("baseUrl is required for an OpenAI-compatible provider")
+            parsed_base_url = urlparse(self.base_url)
+            if parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.netloc:
+                raise ValueError("baseUrl must be an absolute HTTP(S) URL")
+            if parsed_base_url.username or parsed_base_url.password:
+                raise ValueError("baseUrl must not contain embedded credentials")
+            if parsed_base_url.query or parsed_base_url.fragment:
+                raise ValueError("baseUrl must not contain a query or fragment")
+            if not self.chat_completions_path.startswith("/"):
+                raise ValueError("chatCompletionsPath must start with /")
+            if not self.models_path.startswith("/"):
+                raise ValueError("modelsPath must start with /")
+        return self
+
+
+class ModelDiscoveryRequest(ProviderConnectionDraft):
+    pass
+
+
+class ProviderDraft(ProviderConnectionDraft):
+    model: str = Field(default="", max_length=256)
+    available_models: list[str] = Field(
+        default_factory=list,
+        alias="availableModels",
+        max_length=512,
+    )
+
+    @field_validator("model")
+    @classmethod
+    def strip_model(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("available_models")
+    @classmethod
+    def validate_available_models(cls, values: list[str]) -> list[str]:
+        normalized = [str(value).strip() for value in values]
+        if any(not value or len(value) > 256 for value in normalized):
+            raise ValueError("availableModels contains an invalid model ID")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("availableModels must not contain duplicates")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_model(self) -> "ProviderDraft":
+        if self.type == "openai_compatible" and not self.model:
+            raise ValueError("model is required for an OpenAI-compatible provider")
+        return self
+
+
+class ApplyProviderRequest(ProviderDraft):
+    verification_token: str = Field(alias="verificationToken", min_length=32, max_length=256)
+
+
+class AdminConfigManager:
+    def __init__(self, project_dir: Path) -> None:
+        self.project_dir = project_dir.resolve()
+        self.env_path = self.project_dir / ".env"
+        self.template_path = self.project_dir / "config" / "providers.json"
+        self.local_provider_path = self.project_dir / "config" / "providers.local.json"
+        self._lock = threading.Lock()
+        self._verified: dict[str, tuple[str, float]] = {}
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            raw = self._read_provider_config()
+            env_values = read_env_file(self.env_path)
+            providers: list[dict[str, Any]] = []
+            default_id = str(raw.get("defaultProviderId") or "")
+            for provider_id, value in sorted(dict(raw.get("providers") or {}).items()):
+                if not isinstance(value, dict):
+                    continue
+                credential_env = str(value.get("apiKeyEnv") or "")
+                providers.append(
+                    {
+                        "id": str(provider_id),
+                        "type": str(value.get("type") or ""),
+                        "presetId": str(
+                            value.get("presetId")
+                            or _infer_preset_id(
+                                str(value.get("type") or ""),
+                                str(value.get("baseUrl") or ""),
+                            )
+                        ),
+                        "baseUrl": str(value.get("baseUrl") or ""),
+                        "chatCompletionsPath": str(
+                            value.get("chatCompletionsPath") or "/chat/completions"
+                        ),
+                        "modelsPath": str(value.get("modelsPath") or "/models"),
+                        "defaultModel": str(value.get("defaultModel") or ""),
+                        "availableModels": [
+                            str(item) for item in value.get("availableModels", [])
+                        ],
+                        "timeoutSeconds": int(value.get("timeoutSeconds") or 60),
+                        "transportRetries": int(
+                            value.get("transportRetries")
+                            if value.get("transportRetries") is not None
+                            else 2
+                        ),
+                        "credentialConfigured": bool(
+                            credential_env and env_values.get(credential_env, "").strip()
+                        ),
+                        "active": str(provider_id) == default_id,
+                    }
+                )
+            return {
+                "projectDir": str(self.project_dir),
+                "envPath": str(self.env_path),
+                "providerConfigPath": str(self.local_provider_path),
+                "activeProviderId": default_id,
+                "activeModel": str(env_values.get("MPE_ACTIVE_MODEL") or ""),
+                "providerPresets": [dict(preset) for preset in PROVIDER_PRESETS],
+                "providers": providers,
+            }
+
+    def discover_models(self, draft: ModelDiscoveryRequest) -> dict[str, Any]:
+        with self._lock:
+            if draft.type == "mock":
+                return {
+                    "status": "ok",
+                    "providerId": draft.provider_id,
+                    "models": ["schema-sample-v1"],
+                    "elapsedMs": 0,
+                    "attempts": 1,
+                }
+            api_key = self._resolved_api_key(draft)
+            config = ProviderConfig(
+                id=draft.provider_id,
+                type=draft.type,
+                default_model="",
+                base_url=draft.base_url.rstrip("/"),
+                chat_completions_path=draft.chat_completions_path,
+                api_key_env=self._credential_env(draft.provider_id),
+                timeout_seconds=draft.timeout_seconds,
+                transport_retries=draft.transport_retries,
+                cache_identity=f"{draft.provider_id}-models",
+            )
+            provider = OpenAICompatibleProvider(
+                config,
+                credential_resolver=lambda _name: api_key,
+            )
+            result = provider.list_models(models_path=draft.models_path)
+            return {
+                "status": "ok",
+                "providerId": draft.provider_id,
+                **result,
+            }
+
+    def test_provider(self, draft: ProviderDraft) -> dict[str, Any]:
+        with self._lock:
+            api_key = self._resolved_api_key(draft)
+            result = self._call_provider(draft, api_key=api_key)
+            digest = self._draft_digest(draft, api_key=api_key)
+            token = secrets.token_urlsafe(32)
+            self._discard_expired_tokens()
+            self._verified[token] = (digest, time.monotonic() + TEST_TOKEN_TTL_SECONDS)
+            return {
+                "status": "ok",
+                "providerId": draft.provider_id,
+                "model": draft.model or "schema-sample-v1",
+                "elapsedMs": result["elapsedMs"],
+                "verificationToken": token,
+                "expiresInSeconds": TEST_TOKEN_TTL_SECONDS,
+            }
+
+    def apply_provider(self, request: ApplyProviderRequest) -> dict[str, Any]:
+        draft = ProviderDraft.model_validate(
+            request.model_dump(by_alias=True, exclude={"verification_token"})
+        )
+        with self._lock:
+            api_key = self._resolved_api_key(draft)
+            digest = self._draft_digest(draft, api_key=api_key)
+            self._discard_expired_tokens()
+            verified = self._verified.pop(request.verification_token, None)
+            if verified is None or verified[0] != digest or verified[1] < time.monotonic():
+                raise ConfigurationError("Provider verification expired or no longer matches")
+
+            raw = self._read_provider_config()
+            providers = dict(raw.get("providers") or {})
+            existing_provider = providers.get(draft.provider_id)
+            existing_credential_env = (
+                str(existing_provider.get("apiKeyEnv") or "").strip()
+                if isinstance(existing_provider, dict)
+                else ""
+            )
+            credential_env = (
+                existing_credential_env or self._credential_env(draft.provider_id)
+                if draft.type != "mock"
+                else ""
+            )
+            model = draft.model or "schema-sample-v1"
+            available_models = list(draft.available_models)
+            if model not in available_models:
+                available_models.append(model)
+            providers[draft.provider_id] = {
+                "type": draft.type,
+                "presetId": "mock" if draft.type == "mock" else draft.preset_id,
+                "defaultModel": model,
+                # Every successful activation starts a fresh cache namespace. This
+                # avoids sharing cached responses after an account or key change
+                # without persisting a secret-derived identifier.
+                "cacheIdentity": f"{draft.provider_id}-local-{secrets.token_hex(8)}",
+                "availableModels": available_models,
+                "capabilities": ["structured_json"],
+                **(
+                    {
+                        "baseUrl": draft.base_url.rstrip("/"),
+                        "chatCompletionsPath": draft.chat_completions_path,
+                        "modelsPath": draft.models_path,
+                        "apiKeyEnv": credential_env,
+                        "timeoutSeconds": draft.timeout_seconds,
+                        "transportRetries": draft.transport_retries,
+                    }
+                    if draft.type == "openai_compatible"
+                    else {}
+                ),
+            }
+            updated = {
+                "version": 1,
+                "defaultProviderId": draft.provider_id,
+                "providers": providers,
+            }
+            self._validate_provider_config(updated)
+            serialized = json.dumps(updated, ensure_ascii=False, indent=2) + "\n"
+            if len(serialized.encode("utf-8")) > MAX_PROVIDER_CONFIG_BYTES:
+                raise ConfigurationError("Provider configuration is too large")
+            atomic_write_text(self.local_provider_path, serialized, mode=0o600)
+
+            env_updates = {
+                "MPE_PROJECT_DIR": str(self.project_dir),
+                "MPE_PROVIDER_CONFIG": str(self.local_provider_path),
+                "MPE_ACTIVE_PROVIDER": draft.provider_id,
+                "MPE_ACTIVE_MODEL": model,
+            }
+            submitted_key = draft.api_key.get_secret_value() if draft.api_key else ""
+            if credential_env and submitted_key:
+                env_updates[credential_env] = submitted_key
+            updated_env = update_project_environment(self.project_dir, env_updates)
+            # Carry only the values managed by this activation into the detached
+            # restart. Unrelated values in .env must not override a shell-level
+            # environment setting merely because the admin page was used.
+            for key in env_updates:
+                os.environ[key] = updated_env[key]
+            if credential_env:
+                os.environ[credential_env] = api_key
+            return {
+                "status": "saved",
+                "providerId": draft.provider_id,
+                "model": model,
+                "restartRequired": True,
+            }
+
+    def _read_provider_config(self) -> dict[str, Any]:
+        path = self.local_provider_path if self.local_provider_path.is_file() else self.template_path
+        try:
+            if path.stat().st_size > MAX_PROVIDER_CONFIG_BYTES:
+                raise ConfigurationError(f"Provider configuration is too large: {path}")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ConfigurationError(f"Provider configuration not found: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(f"Invalid provider configuration JSON: {path}") from exc
+        if not isinstance(raw, dict):
+            raise ConfigurationError("Provider configuration must be a JSON object")
+        self._validate_provider_config(raw)
+        return raw
+
+    def _validate_provider_config(self, raw: dict[str, Any]) -> None:
+        load_provider_registry_data(
+            raw,
+            factories={
+                "mock": MockProvider,
+                "openai_compatible": OpenAICompatibleProvider,
+            },
+        )
+
+    def _resolved_api_key(self, draft: ProviderConnectionDraft) -> str:
+        if draft.type == "mock":
+            return ""
+        submitted = draft.api_key.get_secret_value().strip() if draft.api_key else ""
+        if submitted:
+            return submitted
+        credential_env = self._existing_credential_env(draft.provider_id)
+        configured = read_env_file(self.env_path).get(credential_env, "")
+        if not configured.strip():
+            raise ConfigurationError("An API key is required before testing this provider")
+        return configured.strip()
+
+    def _existing_credential_env(self, provider_id: str) -> str:
+        raw = self._read_provider_config()
+        provider = dict(raw.get("providers") or {}).get(provider_id)
+        if isinstance(provider, dict):
+            configured = str(provider.get("apiKeyEnv") or "").strip()
+            if configured:
+                return configured
+        return self._credential_env(provider_id)
+
+    @staticmethod
+    def _call_provider(draft: ProviderDraft, *, api_key: str) -> dict[str, int]:
+        model = draft.model or "schema-sample-v1"
+        config = ProviderConfig(
+            id=draft.provider_id,
+            type=draft.type,
+            default_model=model,
+            base_url=draft.base_url.rstrip("/"),
+            chat_completions_path=draft.chat_completions_path,
+            api_key_env=AdminConfigManager._credential_env(draft.provider_id),
+            timeout_seconds=draft.timeout_seconds,
+            transport_retries=draft.transport_retries,
+            cache_identity=f"{draft.provider_id}-test",
+            available_models=(model,),
+        )
+        call_arguments = {
+            "model": model,
+            "system_prompt": 'Return one JSON object with exactly {"status":"ok"}.',
+            "input_payload": {"operation": "mpe_provider_connection_test"},
+            "output_schema": {
+                "type": "object",
+                "required": ["status"],
+                "properties": {"status": {"type": "string"}},
+            },
+            "temperature": 0,
+            "max_tokens": 256,
+        }
+        if draft.type == "mock":
+            call = MockProvider(config).call_json(**call_arguments)
+        else:
+            provider = OpenAICompatibleProvider(
+                config,
+                credential_resolver=lambda _name: api_key,
+            )
+            extra_body = (
+                {"thinking": {"type": "disabled"}}
+                if draft.preset_id == "deepseek"
+                else None
+            )
+            for attempt in range(2):
+                try:
+                    call = provider.call_json(
+                        **call_arguments,
+                        extra_body=extra_body,
+                    )
+                    break
+                except ProviderEmptyContentError:
+                    if attempt == 1:
+                        raise
+        if not isinstance(call.content, dict):
+            raise ConfigurationError("Provider test did not return a JSON object")
+        return {"elapsedMs": call.elapsed_ms}
+
+    @staticmethod
+    def _credential_env(provider_id: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9]", "_", provider_id).upper()
+        suffix = hashlib.sha256(provider_id.encode("utf-8")).hexdigest()[:8].upper()
+        return f"MPE_PROVIDER_{normalized}_{suffix}_API_KEY"
+
+    @staticmethod
+    def _draft_digest(draft: ProviderDraft, *, api_key: str) -> str:
+        payload = draft.model_dump(by_alias=True, exclude={"api_key"})
+        payload["apiKey"] = api_key
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _discard_expired_tokens(self) -> None:
+        now = time.monotonic()
+        expired = [token for token, value in self._verified.items() if value[1] < now]
+        for token in expired:
+            self._verified.pop(token, None)
+
+
+def _infer_preset_id(provider_type: str, base_url: str) -> ProviderPresetId:
+    if provider_type == "mock":
+        return "mock"
+    normalized = base_url.strip().rstrip("/").casefold()
+    for preset in PROVIDER_PRESETS:
+        if preset["id"] in {"custom", "mock"}:
+            continue
+        if normalized == str(preset["baseUrl"]).rstrip("/").casefold():
+            return preset["id"]
+    return "custom"

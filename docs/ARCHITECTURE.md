@@ -77,6 +77,30 @@ The HTTP path version comes from one runtime constant. Provider capability and
 configured-model declarations are exposed without credential environment names
 or secret values.
 
+## Local Administration Boundary
+
+The loopback-only `/admin` surface manages deployment configuration, not caller
+business tasks. The same-origin page sends strictly validated Provider drafts to
+versioned admin routes. Mutations require a per-process CSRF token, a loopback
+Host, and an exact Origin match. Admin routes are unavailable when remote mode is
+enabled.
+
+Provider tests use submitted credentials only in memory. A successful test
+issues a short-lived token bound to the exact Provider/model-list/default-model/
+key payload. Only a matching token can activate that payload. Provider presets
+are non-secret UI defaults; protocol type remains the runtime boundary. Model
+discovery uses the configured OpenAI-compatible `/models` path and submitted or
+previously stored credential only in memory, with manual model entry as the
+compatibility fallback. Activation atomically writes the project `.env` and
+ignored `config/providers.local.json`, then starts a detached control helper
+that uses the existing verified process manager to restart the service. The UI
+polls health and obtains a new CSRF token after recovery.
+
+Secrets remain plaintext by the explicitly selected project `.env` policy, but
+the file is Git-ignored, mode `0600` on Unix, never returned over the API, and
+never duplicated into automatic backups. Process environment variables remain
+the higher-precedence deployment override.
+
 ## Complexity Gate
 
 The service is L3: it exposes a local network interface, accepts external input,
@@ -85,7 +109,9 @@ design pillars are module boundaries, security, schema validation, versioned API
 cache consistency, observability, dependency control, tests, and machine-checked
 guards.
 
-Browser UI lazy loading is not applicable because the core ships no UI. Formal
-public release management is deferred until the tool is distributed outside its
-owner-controlled environment. Cache backup is not required because cache entries
-are disposable; callers own durable-result backup.
+UI code splitting is not applicable because the admin page is a small,
+dependency-free surface. Formal public release management is deferred until the
+tool is distributed outside its owner-controlled environment. Cache backup is
+not required because cache entries are disposable; callers own durable-result
+backup. Project `.env` backup is intentionally not automated because it contains
+replaceable credentials and the selected policy forbids extra secret copies.

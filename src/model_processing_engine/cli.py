@@ -91,6 +91,14 @@ def _run(args: argparse.Namespace) -> int:
     if args.command == "status":
         _print_json(service_status(load_settings(args.root)))
         return 0
+    if args.command == "admin":
+        import webbrowser
+
+        status = service_status(load_settings(args.root))
+        admin_url = str(status["url"]).rstrip("/") + "/admin"
+        opened = False if args.print_only else webbrowser.open(admin_url)
+        _print_json({"status": status["status"], "adminUrl": admin_url, "opened": opened})
+        return 0
     parser.error("Unknown command")
     return 2
 
@@ -131,6 +139,9 @@ def _parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="Inspect the local service state")
     status.add_argument("--root")
+    admin = subparsers.add_parser("admin", help="Open the loopback management page")
+    admin.add_argument("--root")
+    admin.add_argument("--print-only", action="store_true")
     return parser
 
 

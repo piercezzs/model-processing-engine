@@ -191,6 +191,17 @@ class ServiceAndCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('"status": "stopped"', stdout.getvalue())
 
+    def test_cli_admin_can_print_without_opening_a_browser(self) -> None:
+        stdout = io.StringIO()
+        with patch(
+            "model_processing_engine.cli.service_status",
+            return_value={"status": "running", "url": "http://127.0.0.1:8787"},
+        ), patch("webbrowser.open") as open_browser, redirect_stdout(stdout):
+            code = main(["admin", "--print-only", "--root", "/tmp/mpe-test-root"])
+        self.assertEqual(code, 0)
+        open_browser.assert_not_called()
+        self.assertIn('"adminUrl": "http://127.0.0.1:8787/admin"', stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

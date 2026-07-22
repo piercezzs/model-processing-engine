@@ -109,6 +109,14 @@ def load_provider_registry(
         raise ConfigurationError(f"Provider configuration not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise ConfigurationError(f"Invalid provider configuration JSON: {path}") from exc
+    return load_provider_registry_data(raw, factories=factories)
+
+
+def load_provider_registry_data(
+    raw: Any,
+    *,
+    factories: dict[str, ProviderFactory],
+) -> ProviderRegistry:
     if not isinstance(raw, dict):
         raise ConfigurationError("Provider configuration must be a JSON object")
     providers: dict[str, ModelProvider] = {}

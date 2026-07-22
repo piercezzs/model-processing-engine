@@ -13,6 +13,10 @@ class ProviderError(ModelProcessingError):
     """A provider could not complete a model request."""
 
 
+class ProviderEmptyContentError(ProviderError):
+    """A provider completed a request but returned no assistant content."""
+
+
 class ConfigurationError(ModelProcessingError):
     """Local runtime configuration is invalid or incomplete."""
 

@@ -86,7 +86,10 @@ class SettingsAndProviderTests(unittest.TestCase):
             }
         )
         with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
-            with patch("urllib.request.urlopen", return_value=response):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ):
                 result = provider.call_json(
                     model="",
                     system_prompt="Return JSON",
@@ -97,6 +100,39 @@ class SettingsAndProviderTests(unittest.TestCase):
                 )
         self.assertEqual(result.content, {"answer": True})
         self.assertEqual(result.usage["totalTokens"], 5)
+
+    def test_openai_compatible_provider_adds_non_conflicting_extra_body(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {"choices": [{"message": {"content": '{"status":"ok"}'}}]}
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload={},
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=256,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["max_tokens"], 256)
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
 
     def test_openai_compatible_provider_requires_environment_secret(self) -> None:
         provider = OpenAICompatibleProvider(
@@ -118,6 +154,41 @@ class SettingsAndProviderTests(unittest.TestCase):
                     temperature=0,
                     max_tokens=None,
                 )
+
+    def test_openai_compatible_provider_lists_unique_models(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {
+                "object": "list",
+                "data": [
+                    {"id": "model-two"},
+                    {"id": "model-one"},
+                    {"id": "model-two"},
+                    {"object": "model"},
+                ],
+            }
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                result = provider.list_models(models_path="/models")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://example.invalid/v1/models")
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(result["models"], ["model-two", "model-one"])
+        self.assertEqual(result["attempts"], 1)
 
     def test_provider_cache_identity_changes_provider_digest(self) -> None:
         first = ProviderConfig(

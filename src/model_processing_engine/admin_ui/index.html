@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MPE 模型管理</title>
+  <link rel="stylesheet" href="/admin/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">MODEL PROCESSING ENGINE</p>
+        <h1>模型管理</h1>
+      </div>
+      <div class="service-state" aria-live="polite">
+        <span class="status-dot" id="service-dot"></span>
+        <span id="service-label">正在连接服务</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="provider-panel" aria-label="模型平台">
+        <div class="panel-heading">
+          <div>
+            <p class="section-label">PROVIDERS</p>
+            <h2>模型平台</h2>
+          </div>
+          <button class="icon-button" id="add-provider" type="button" aria-label="新增模型平台">＋</button>
+        </div>
+        <div class="provider-list" id="provider-list"></div>
+        <div class="storage-note">
+          <span>本地配置</span>
+          <code id="env-path">正在读取...</code>
+        </div>
+      </aside>
+
+      <section class="editor-panel">
+        <div class="editor-heading">
+          <div>
+            <p class="section-label">CONFIGURATION</p>
+            <h2 id="editor-title">配置模型平台</h2>
+          </div>
+          <span class="active-badge" id="active-badge" hidden>当前激活</span>
+        </div>
+
+        <form id="provider-form" autocomplete="off">
+          <div class="field-grid two-columns">
+            <label class="field">
+              <span>模型服务商</span>
+              <select id="provider-preset" name="providerPreset"></select>
+            </label>
+            <label class="field">
+              <span>配置名称</span>
+              <input id="provider-id" name="providerId" type="text" maxlength="64" placeholder="例如 deepseek" required>
+              <small>供接入项目识别，例如 deepseek 或 team-gateway。</small>
+            </label>
+          </div>
+
+          <div id="remote-fields">
+            <label class="field">
+              <span>Base URL</span>
+              <input id="base-url" name="baseUrl" type="url" maxlength="2048" placeholder="https://api.example.com/v1">
+            </label>
+
+            <label class="field">
+              <span>API Key</span>
+              <div class="secret-control">
+                <input id="api-key" name="apiKey" type="password" maxlength="16384" placeholder="填写新 Key，留空则保留已有值" autocomplete="new-password">
+                <button id="toggle-key" class="text-button" type="button">显示</button>
+              </div>
+              <small id="credential-state">尚未配置</small>
+            </label>
+          </div>
+
+          <div class="field model-field">
+            <div class="field-heading">
+              <span>默认执行模型</span>
+              <button class="compact-button" id="discover-models" type="button">检测并获取模型</button>
+            </div>
+            <select id="model-select" name="modelSelect" aria-label="默认执行模型"></select>
+            <input id="model-manual" name="modelManual" type="text" maxlength="256" placeholder="手动填写模型 ID" hidden>
+            <small id="model-state">尚未获取模型；也可以手动填写模型 ID。</small>
+          </div>
+
+          <details class="advanced-settings">
+            <summary>高级连接设置</summary>
+            <div class="field-grid two-columns advanced-grid">
+              <label class="field">
+                <span>接口协议</span>
+                <select id="provider-type" name="providerType">
+                  <option value="openai_compatible">OpenAI Chat Completions</option>
+                  <option value="mock">Mock（离线测试）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>模型请求路径</span>
+                <input id="chat-path" name="chatPath" type="text" maxlength="512" value="/chat/completions">
+              </label>
+              <label class="field">
+                <span>模型列表路径</span>
+                <input id="models-path" name="modelsPath" type="text" maxlength="512" value="/models">
+              </label>
+              <label class="field">
+                <span>超时时间（秒）</span>
+                <input id="timeout-seconds" name="timeoutSeconds" type="number" min="1" max="600" value="60">
+              </label>
+              <label class="field">
+                <span>传输重试次数</span>
+                <input id="transport-retries" name="transportRetries" type="number" min="0" max="5" value="2">
+              </label>
+            </div>
+            <p class="advanced-help">
+              普通服务商无需修改。完整请求地址由 Base URL 与对应路径拼接。
+            </p>
+          </details>
+
+          <div class="notice" id="security-notice">
+            Key 只会在测试成功后写入项目根目录的 <code>.env</code>，页面不会读取或显示已有 Key 明文。
+          </div>
+
+          <div class="result-box neutral" id="result-box" role="status" aria-live="polite">
+            填写配置后，先测试连接，再保存并激活。
+          </div>
+
+          <div class="form-actions">
+            <button class="secondary-button" id="test-provider" type="button">测试连接</button>
+            <button class="primary-button" id="apply-provider" type="button" disabled>保存并激活</button>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div class="restart-overlay" id="restart-overlay" hidden>
+    <div class="restart-card">
+      <span class="spinner" aria-hidden="true"></span>
+      <h2>正在应用模型配置</h2>
+      <p id="restart-message">MPE 正在安全重启，请稍候。</p>
+    </div>
+  </div>
+
+  <script src="/admin/app.js" defer></script>
+</body>
+</html>

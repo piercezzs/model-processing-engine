@@ -34,6 +34,76 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 ```
 
+For one-click local setup and managed service startup, use the platform wrapper:
+
+```bash
+# macOS: Terminal or Finder double-click
+chmod +x start_mpe.command stop_mpe.command
+./start_mpe.command
+
+# Windows: Command Prompt or Explorer double-click
+start_mpe.bat
+```
+
+The start wrapper finds Python 3.10 or newer, creates or repairs `.venv`, installs
+runtime dependencies from `pyproject.toml`, and records a dependency fingerprint
+so unchanged environments can be reused without reinstalling. It delegates
+service identity and port-conflict handling to MPE's verified process manager
+and never terminates a process merely because port `8787` is occupied.
+
+Run the non-starting readiness check after setup with
+`./start_mpe.command --check-only` on macOS or `start_mpe.bat --check-only` on
+Windows. Stop the verified managed service with `./stop_mpe.command` or
+`stop_mpe.bat`.
+
+Normal one-click startup opens the loopback management page at `/admin` after
+verified health. Use `--no-open` to start without opening a browser. The
+management page is disabled for remote bindings.
+
+## Local model management
+
+The management page is the normal local entry for Provider, model, and API-key
+configuration:
+
+```text
+http://127.0.0.1:8787/admin
+```
+
+Choose a known service preset such as OpenAI or DeepSeek, or use the custom
+OpenAI-compatible option. Presets fill the protocol URL and endpoint paths but
+remain editable. After an API key is available, **Detect and fetch models**
+requests the Provider's configured `/models` endpoint and populates the default
+model picker. Providers without a compatible model-list endpoint can still use
+a manually entered model ID.
+
+One Provider configuration can retain multiple discovered model IDs and one
+default execution model. Calling projects may still override that model in an
+execution request. Chat-completions protocol, request/list paths, timeout, and
+transport retry count live under advanced connection settings.
+
+MPE first tests the exact submitted Provider, model list, default model, and key
+in memory. Only a matching, unexpired successful test can be saved and
+activated. Model discovery and failed connection tests do not modify project
+files.
+
+Successful activation writes user-managed state inside this project checkout:
+
+- `.env`: active Provider/model, absolute local Provider-config path, and API
+  key. This file is plaintext, mode `0600` on macOS, and ignored by Git.
+- `config/providers.local.json`: non-secret Provider metadata. This file is also
+  ignored by Git.
+
+Both files are written with atomic replacement. Existing keys are never
+returned by the API or management page; the UI shows only whether a credential
+is configured. After saving, MPE schedules a verified managed restart and the
+page waits for the new service health response. A failed connection test does
+not modify either file.
+
+The project `.env` is loaded automatically when MPE starts through the platform
+wrapper. Existing process environment variables take precedence, which keeps
+headless and CI deployment overrides available. Do not commit, copy, or share
+the project `.env` file.
+
 The bundled default provider is deterministic `mock`; it makes the repository
 runnable without network access or credentials. Copy `config/providers.json` to
 your deployment configuration and set `MPE_PROVIDER_CONFIG` before real calls.
@@ -188,6 +258,11 @@ Available routes:
 - `POST /v1/executions`
 - `GET /v1/executions/{execution_id}`
 - `POST /v1/cache/cleanup`
+- `GET /admin` (loopback management page)
+- `GET /v1/admin/config` (masked local configuration)
+- `POST /v1/admin/providers/test` (same-origin and CSRF protected)
+- `POST /v1/admin/providers/models` (in-memory Provider model discovery)
+- `POST /v1/admin/providers/apply` (same-origin and CSRF protected)
 
 HTTP requests contain the resolved `TaskDefinition` and input data, never a
 server-side task directory path. This keeps filesystem ownership with the

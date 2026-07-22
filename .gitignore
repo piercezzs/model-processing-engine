@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+config/providers.local.json
 data/runtime/
 logs/
 run/

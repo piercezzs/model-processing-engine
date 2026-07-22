@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .exceptions import ConfigurationError
+from .project_environment import discover_project_dir, load_project_environment
 
 
 PACKAGE_PROVIDER_CONFIG = Path(__file__).with_name("default_providers.json")
@@ -26,6 +27,7 @@ class Settings:
     api_token: str = ""
     log_dir: Path | None = None
     run_dir: Path | None = None
+    project_dir: Path | None = None
 
     @property
     def database_path(self) -> Path:
@@ -50,6 +52,11 @@ class Settings:
 
 
 def load_settings(root: str | Path | None = None) -> Settings:
+    explicit_project_dir = os.environ.get("MPE_PROJECT_DIR")
+    project_dir = discover_project_dir(
+        explicit=explicit_project_dir,
+    ) if explicit_project_dir or root is None else None
+    load_project_environment(project_dir)
     resolved_root = _runtime_root(root)
     configured_provider_path = os.environ.get("MPE_PROVIDER_CONFIG")
     repository_provider_config = resolved_root / "config" / "providers.json"
@@ -106,6 +113,7 @@ def load_settings(root: str | Path | None = None) -> Settings:
         api_token=api_token,
         log_dir=log_dir,
         run_dir=run_dir,
+        project_dir=project_dir,
     )
 
 
