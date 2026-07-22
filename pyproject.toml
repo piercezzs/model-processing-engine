@@ -1,0 +1,33 @@
+[project]
+name = "model-processing-engine"
+version = "0.1.0"
+description = "Business-neutral runtime for externally defined model tasks."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "jsonschema>=4.23,<5",
+  "pydantic>=2.8,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27,<1",
+]
+
+[project.scripts]
+mpe = "model_processing_engine.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+model_processing_engine = ["default_providers.json"]
+
+[tool.ruff]
+line-length = 100

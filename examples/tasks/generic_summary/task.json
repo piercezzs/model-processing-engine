@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "namespace": "example-project",
+  "id": "generic_summary",
+  "version": "1",
+  "title": "Generic Structured Summary",
+  "promptPath": "prompt.md",
+  "inputSchemaPath": "input.schema.json",
+  "outputSchemaPath": "output.schema.json",
+  "cachePolicy": {
+    "mode": "exact",
+    "semanticVersion": "generic-summary-v1",
+    "ttlSeconds": null,
+    "sensitive": false
+  },
+  "runtimeDefaults": {
+    "providerId": "mock",
+    "model": "schema-sample-v1",
+    "temperature": 0.1
+  }
+}

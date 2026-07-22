@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "defaultProviderId": "mock",
+  "providers": {
+    "mock": {
+      "type": "mock",
+      "defaultModel": "schema-sample-v1",
+      "cacheIdentity": "mock-v1"
+    }
+  }
+}

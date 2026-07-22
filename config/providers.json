@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "defaultProviderId": "mock",
+  "providers": {
+    "mock": {
+      "type": "mock",
+      "defaultModel": "schema-sample-v1",
+      "cacheIdentity": "mock-v1"
+    },
+    "openai-compatible": {
+      "type": "openai_compatible",
+      "baseUrl": "https://api.openai.com/v1",
+      "chatCompletionsPath": "/chat/completions",
+      "apiKeyEnv": "MPE_AI_API_KEY",
+      "defaultModel": "",
+      "timeoutSeconds": 60,
+      "transportRetries": 2,
+      "cacheIdentity": "account-and-endpoint-v1"
+    }
+  }
+}

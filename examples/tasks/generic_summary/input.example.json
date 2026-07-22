@@ -1,0 +1,3 @@
+{
+  "text": "A model runtime should execute externally defined tasks without owning caller business semantics."
+}
