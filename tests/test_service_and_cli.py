@@ -39,7 +39,7 @@ class ServiceAndCliTests(unittest.TestCase):
             response = client.post("/v1/executions", json=sync_payload)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["status"], "succeeded")
-
+            self.assertEqual(client.get("/v1/executions").status_code, 405)
             async_payload = execution_request(
                 task_definition(task_id="async-task"),
                 async_mode=True,
@@ -180,6 +180,7 @@ class ServiceAndCliTests(unittest.TestCase):
             payload = client.get("/v1/providers").json()
             self.assertEqual(payload["providers"], ["mock"])
             self.assertEqual(payload["providerDetails"][0]["id"], "mock")
+            self.assertEqual(payload["providerDetails"][0]["maxConcurrency"], 8)
 
     def test_cli_status_prints_manager_result(self) -> None:
         stdout = io.StringIO()

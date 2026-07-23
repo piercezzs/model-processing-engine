@@ -48,7 +48,12 @@ class AdminConfigManagerTests(unittest.TestCase):
             project = self._project(Path(temp_dir))
             manager = AdminConfigManager(project)
             draft = ProviderDraft.model_validate(
-                {"providerId": "mock", "type": "mock", "model": "schema-sample-v1"}
+                {
+                    "providerId": "mock",
+                    "type": "mock",
+                    "model": "schema-sample-v1",
+                    "maxConcurrency": 3,
+                }
             )
             tested = manager.test_provider(draft)
             request = ApplyProviderRequest.model_validate(
@@ -67,7 +72,9 @@ class AdminConfigManagerTests(unittest.TestCase):
                 (project / "config" / "providers.local.json").read_text(encoding="utf-8")
             )
             self.assertEqual(local["defaultProviderId"], "mock")
+            self.assertEqual(local["providers"]["mock"]["maxConcurrency"], 3)
             self.assertTrue(manager.snapshot()["providers"][0]["active"])
+            self.assertEqual(manager.snapshot()["providers"][0]["maxConcurrency"], 3)
 
     def test_openai_key_is_written_only_after_verified_apply(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
@@ -108,6 +115,7 @@ class AdminConfigManagerTests(unittest.TestCase):
             self.assertTrue(selected["credentialConfigured"])
             self.assertEqual(selected["availableModels"], ["model-one", "model-two"])
             self.assertEqual(selected["modelsPath"], "/models")
+            self.assertEqual(selected["maxConcurrency"], 8)
 
     def test_model_discovery_uses_key_without_persisting_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
@@ -158,7 +166,9 @@ class AdminConfigManagerTests(unittest.TestCase):
         ) as call_json:
             result = AdminConfigManager._call_provider(draft, api_key="temporary-secret")
 
-        self.assertEqual(result, {"elapsedMs": 9})
+        self.assertEqual(result["elapsedMs"], 9)
+        self.assertEqual(result["providerCallCount"], 2)
+        self.assertEqual(result["transportRetries"], 0)
         self.assertEqual(call_json.call_count, 2)
         self.assertEqual(call_json.call_args.kwargs["max_tokens"], 256)
         self.assertEqual(

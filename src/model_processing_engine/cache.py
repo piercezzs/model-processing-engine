@@ -76,6 +76,24 @@ class SQLiteRuntimeStore:
 
                 CREATE INDEX IF NOT EXISTS execution_records_status_idx
                 ON execution_records(status, updated_at);
+
+                CREATE TABLE IF NOT EXISTS provider_call_records (
+                    call_id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    usage_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    elapsed_ms INTEGER NOT NULL,
+                    error TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS provider_call_execution_idx
+                ON provider_call_records(execution_id, sequence);
                 """
             )
 
@@ -183,6 +201,23 @@ class SQLiteRuntimeStore:
             )
             return max(0, int(cursor.rowcount))
 
+    def purge_cache_schema_mismatches(self, expected_schema: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT namespace, cache_key, metadata_json FROM cache_entries"
+            ).fetchall()
+            stale_entries = [
+                (str(row["namespace"]), str(row["cache_key"]))
+                for row in rows
+                if _json_object(row["metadata_json"]).get("cacheSchema")
+                != expected_schema
+            ]
+            connection.executemany(
+                "DELETE FROM cache_entries WHERE namespace = ? AND cache_key = ?",
+                stale_entries,
+            )
+            return len(stale_entries)
+
     def purge_namespace(self, namespace: str) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -243,6 +278,104 @@ class SQLiteRuntimeStore:
             ).fetchone()
         return _json_object(row["envelope_json"]) if row else None
 
+    def save_provider_call(self, record: dict[str, Any]) -> None:
+        call_id = str(record.get("callId") or "")
+        execution_id = str(record.get("executionId") or "")
+        if not call_id or not execution_id:
+            raise ValueError("callId and executionId are required")
+        usage = record.get("usage") if isinstance(record.get("usage"), dict) else {}
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_call_records (
+                    call_id, execution_id, purpose, sequence, provider_id,
+                    model, status, usage_json, attempts, elapsed_ms, error,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    call_id,
+                    execution_id,
+                    str(record.get("purpose") or "task"),
+                    max(1, int(record.get("sequence") or 1)),
+                    str(record.get("providerId") or ""),
+                    str(record.get("model") or ""),
+                    str(record.get("status") or "failed"),
+                    _json_text(usage),
+                    _non_negative_int(record.get("attempts")),
+                    _non_negative_int(record.get("elapsedMs")),
+                    str(record.get("error") or "")[:240],
+                    time.time(),
+                ),
+            )
+
+    def execution_history(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        namespace: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if namespace:
+            clauses.append("namespace = ?")
+            parameters.append(namespace)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        bounded_limit = max(1, min(int(limit), 200))
+        bounded_offset = max(0, int(offset))
+        with self._connect() as connection:
+            total_row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM execution_records{where}",
+                tuple(parameters),
+            ).fetchone()
+            page_rows = connection.execute(
+                f"""
+                SELECT execution_id, envelope_json
+                FROM execution_records{where}
+                ORDER BY updated_at DESC, execution_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, bounded_limit, bounded_offset),
+            ).fetchall()
+            aggregate_rows = connection.execute(
+                f"SELECT execution_id, envelope_json FROM execution_records{where}",
+                tuple(parameters),
+            ).fetchall()
+            provider_calls = _provider_calls_by_execution(
+                connection,
+                [str(row["execution_id"]) for row in aggregate_rows],
+            )
+        items = [
+            _execution_summary(
+                _json_object(row["envelope_json"]),
+                provider_calls.get(str(row["execution_id"]), []),
+            )
+            for row in page_rows
+        ]
+        aggregate_items = [
+            _execution_summary(
+                _json_object(row["envelope_json"]),
+                provider_calls.get(str(row["execution_id"]), []),
+            )
+            for row in aggregate_rows
+        ]
+        total = int(total_row["count"] if total_row else 0)
+        return {
+            "items": items,
+            "summary": _execution_aggregate(aggregate_items),
+            "pagination": {
+                "limit": bounded_limit,
+                "offset": bounded_offset,
+                "total": total,
+                "hasMore": bounded_offset + len(items) < total,
+            },
+        }
+
     def recover_incomplete_executions(self) -> int:
         with self._connect() as connection:
             rows = connection.execute(
@@ -274,3 +407,188 @@ def _json_text(value: Any) -> str:
 def _json_object(value: str) -> dict[str, Any]:
     parsed = json.loads(value)
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _execution_summary(
+    envelope: dict[str, Any],
+    provider_calls: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    task = envelope.get("task") if isinstance(envelope.get("task"), dict) else {}
+    provider = (
+        envelope.get("provider")
+        if isinstance(envelope.get("provider"), dict)
+        else {}
+    )
+    cache = envelope.get("cache") if isinstance(envelope.get("cache"), dict) else {}
+    usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+    timing = envelope.get("timing") if isinstance(envelope.get("timing"), dict) else {}
+    calls = provider_calls or []
+    if calls:
+        usage = _provider_call_usage(calls)
+        timing = {
+            **timing,
+            "providerElapsedMs": sum(
+                _non_negative_int(call.get("elapsedMs")) for call in calls
+            ),
+            "providerCallCount": len(calls),
+            "transportRetries": sum(
+                max(0, _non_negative_int(call.get("attempts")) - 1)
+                for call in calls
+            ),
+        }
+    call_error = next(
+        (str(call.get("error") or "") for call in calls if call.get("status") == "failed"),
+        "",
+    )
+    return {
+        "executionId": str(envelope.get("executionId") or ""),
+        "status": str(envelope.get("status") or "failed"),
+        "kind": str(task.get("kind") or "task"),
+        "task": {
+            "namespace": str(task.get("namespace") or ""),
+            "id": str(task.get("id") or ""),
+            "version": str(task.get("version") or ""),
+        },
+        "provider": {
+            "id": str(provider.get("id") or ""),
+            "model": str(provider.get("model") or ""),
+        },
+        "cache": {
+            "hit": bool(cache.get("hit")),
+            "source": str(cache.get("source") or ""),
+            "hitCount": _non_negative_int(cache.get("hitCount")),
+        },
+        "usage": {
+            "available": bool(usage.get("available")),
+            "inputTokens": _non_negative_int(usage.get("inputTokens")),
+            "outputTokens": _non_negative_int(usage.get("outputTokens")),
+            "totalTokens": _non_negative_int(usage.get("totalTokens")),
+            "cacheReadInputTokens": _non_negative_int(
+                usage.get("cacheReadInputTokens")
+            ),
+            "source": str(usage.get("source") or ""),
+        },
+        "timing": {
+            "createdAt": str(timing.get("createdAt") or ""),
+            "completedAt": str(timing.get("completedAt") or ""),
+            "elapsedMs": _non_negative_int(timing.get("elapsedMs")),
+            "providerElapsedMs": _non_negative_int(
+                timing.get("providerElapsedMs")
+            ),
+            "providerCallCount": _non_negative_int(
+                timing.get("providerCallCount")
+            ),
+            "transportRetries": _non_negative_int(
+                timing.get("transportRetries")
+            ),
+        },
+        "error": call_error or _redacted_history_error(envelope.get("error")),
+    }
+
+
+def _execution_aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0}
+    usage_fields = (
+        "inputTokens",
+        "outputTokens",
+        "totalTokens",
+        "cacheReadInputTokens",
+    )
+    usage = {field: 0 for field in usage_fields}
+    usage_available = 0
+    cache_hits = 0
+    provider_cache_hit_executions = 0
+    provider_calls = 0
+    transport_retries = 0
+    provider_tests = 0
+    for item in items:
+        status = item.get("status")
+        if status in statuses:
+            statuses[status] += 1
+        if item.get("kind") == "provider_test":
+            provider_tests += 1
+        cache_hits += int(bool(item.get("cache", {}).get("hit")))
+        item_usage = item.get("usage", {})
+        usage_available += int(bool(item_usage.get("available")))
+        provider_cache_hit_executions += int(
+            _non_negative_int(item_usage.get("cacheReadInputTokens")) > 0
+        )
+        for field in usage_fields:
+            usage[field] += _non_negative_int(item_usage.get(field))
+        timing = item.get("timing", {})
+        provider_calls += _non_negative_int(timing.get("providerCallCount"))
+        transport_retries += _non_negative_int(timing.get("transportRetries"))
+    return {
+        "total": len(items),
+        **statuses,
+        "providerTests": provider_tests,
+        "cacheHits": cache_hits,
+        "providerCacheHitExecutions": provider_cache_hit_executions,
+        "providerCallCount": provider_calls,
+        "transportRetries": transport_retries,
+        "usageAvailableExecutions": usage_available,
+        "usage": usage,
+    }
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _provider_calls_by_execution(
+    connection: sqlite3.Connection,
+    execution_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    unique_ids = list(dict.fromkeys(value for value in execution_ids if value))
+    for start in range(0, len(unique_ids), 500):
+        chunk = unique_ids[start : start + 500]
+        placeholders = ",".join("?" for _value in chunk)
+        rows = connection.execute(
+            f"""
+            SELECT execution_id, status, usage_json, attempts, elapsed_ms, error
+            FROM provider_call_records
+            WHERE execution_id IN ({placeholders})
+            ORDER BY execution_id, sequence, created_at
+            """,
+            tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            grouped.setdefault(str(row["execution_id"]), []).append(
+                {
+                    "status": str(row["status"]),
+                    "usage": _json_object(row["usage_json"]),
+                    "attempts": int(row["attempts"]),
+                    "elapsedMs": int(row["elapsed_ms"]),
+                    "error": str(row["error"]),
+                }
+            )
+    return grouped
+
+
+def _provider_call_usage(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = ("inputTokens", "outputTokens", "totalTokens", "cacheReadInputTokens")
+    return {
+        "available": any(bool(call.get("usage", {}).get("available")) for call in calls),
+        **{
+            field: sum(
+                _non_negative_int(call.get("usage", {}).get(field))
+                for call in calls
+            )
+            for field in fields
+        },
+        "source": "provider_call_audit",
+    }
+
+
+def _redacted_history_error(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    prefix, separator, _detail = text.partition(":")
+    if separator and prefix.endswith(("Error", "Exception")):
+        return prefix
+    return text[:240]

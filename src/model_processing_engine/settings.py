@@ -91,9 +91,9 @@ def load_settings(root: str | Path | None = None) -> Settings:
     port = _bounded_int("MPE_PORT", default=8787, minimum=1, maximum=65535)
     max_concurrency = _bounded_int(
         "MPE_MAX_PROVIDER_CONCURRENCY",
-        default=8,
+        default=64,
         minimum=1,
-        maximum=64,
+        maximum=256,
     )
     max_request_bytes = _bounded_int(
         "MPE_MAX_REQUEST_BYTES",

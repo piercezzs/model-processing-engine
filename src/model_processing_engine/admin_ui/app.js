@@ -34,6 +34,7 @@ const elements = {
   modelState: document.querySelector("#model-state"),
   discoverModels: document.querySelector("#discover-models"),
   timeoutSeconds: document.querySelector("#timeout-seconds"),
+  maxConcurrency: document.querySelector("#max-concurrency"),
   transportRetries: document.querySelector("#transport-retries"),
   remoteFields: document.querySelector("#remote-fields"),
   resultBox: document.querySelector("#result-box"),
@@ -41,7 +42,20 @@ const elements = {
   applyProvider: document.querySelector("#apply-provider"),
   restartOverlay: document.querySelector("#restart-overlay"),
   restartMessage: document.querySelector("#restart-message"),
+  refreshHistory: document.querySelector("#refresh-history"),
+  historyTotal: document.querySelector("#history-total"),
+  historyTokens: document.querySelector("#history-tokens"),
+  historyUsageCoverage: document.querySelector("#history-usage-coverage"),
+  historyCacheHits: document.querySelector("#history-cache-hits"),
+  historyProviderCacheTokens: document.querySelector("#history-provider-cache-tokens"),
+  historyProviderCacheCoverage: document.querySelector("#history-provider-cache-coverage"),
+  historyProviderCalls: document.querySelector("#history-provider-calls"),
+  historyTransportRetries: document.querySelector("#history-transport-retries"),
+  historyState: document.querySelector("#history-state"),
+  historyList: document.querySelector("#history-list"),
 };
+
+const numberFormatter = new Intl.NumberFormat("zh-CN");
 
 function setServiceState(online, label) {
   elements.serviceDot.classList.toggle("online", online);
@@ -61,6 +75,137 @@ function setButtonLoading(button, loading, loadingLabel) {
   } else {
     button.textContent = button.dataset.originalLabel || button.textContent;
     button.disabled = false;
+  }
+}
+
+function formatNumber(value) {
+  return numberFormatter.format(Math.max(0, Number(value) || 0));
+}
+
+function formatRatio(numerator, denominator) {
+  const total = Math.max(0, Number(denominator) || 0);
+  if (!total) {
+    return "0.0%";
+  }
+  const value = Math.max(0, Number(numerator) || 0);
+  return `${((value / total) * 100).toFixed(1)}%`;
+}
+
+function formatHistoryTime(value) {
+  if (!value) {
+    return "时间未知";
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? value
+    : parsed.toLocaleString("zh-CN", {hour12: false});
+}
+
+function historyStatusLabel(status) {
+  return {
+    queued: "等待中",
+    running: "执行中",
+    succeeded: "成功",
+    failed: "失败",
+  }[status] || status || "未知";
+}
+
+function historyTaskLabel(item) {
+  if (item.kind === "provider_test") {
+    return "连接测试";
+  }
+  const task = item.task || {};
+  return [task.namespace, task.id].filter(Boolean).join(" / ") || "未命名任务";
+}
+
+function renderHistory(payload) {
+  const summary = payload.summary || {};
+  const usage = summary.usage || {};
+  elements.historyTotal.textContent = formatNumber(summary.total);
+  elements.historyTokens.textContent = formatNumber(usage.totalTokens);
+  elements.historyUsageCoverage.textContent = `${formatNumber(summary.usageAvailableExecutions)}/${formatNumber(summary.total)} 条提供 usage`;
+  elements.historyCacheHits.textContent = formatNumber(summary.cacheHits);
+  elements.historyProviderCacheTokens.textContent = formatNumber(usage.cacheReadInputTokens);
+  elements.historyProviderCacheCoverage.textContent =
+    `${formatNumber(summary.providerCacheHitExecutions)} 条命中 · ` +
+    `${formatRatio(usage.cacheReadInputTokens, usage.inputTokens)} 输入`;
+  elements.historyProviderCalls.textContent = formatNumber(summary.providerCallCount);
+  elements.historyTransportRetries.textContent =
+    `${formatNumber(summary.transportRetries)} 次传输重试`;
+  elements.historyList.replaceChildren();
+
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  if (!items.length) {
+    elements.historyState.textContent = "尚无正式任务或 Provider 连接测试记录。";
+    return;
+  }
+  elements.historyState.textContent = `显示最近 ${formatNumber(items.length)} 条；记录不包含模型正文。`;
+  for (const item of items) {
+    const record = document.createElement("article");
+    record.className = "history-record";
+
+    const time = document.createElement("time");
+    const completedAt = item.timing?.completedAt || item.timing?.createdAt || "";
+    time.dateTime = completedAt;
+    time.textContent = formatHistoryTime(completedAt);
+
+    const identity = document.createElement("div");
+    identity.className = "history-identity";
+    const taskName = document.createElement("strong");
+    taskName.textContent = historyTaskLabel(item);
+    const provider = document.createElement("span");
+    provider.textContent = [item.provider?.id, item.provider?.model]
+      .filter(Boolean)
+      .join(" · ") || "Provider 未知";
+    identity.append(taskName, provider);
+
+    const status = document.createElement("span");
+    status.className = `history-status ${item.status || "unknown"}`;
+    status.textContent = historyStatusLabel(item.status);
+
+    const usageCell = document.createElement("div");
+    usageCell.className = "history-usage";
+    const tokenCount = document.createElement("strong");
+    tokenCount.textContent = item.usage?.available
+      ? `${formatNumber(item.usage.totalTokens)} Token`
+      : "Token 未提供";
+    const cacheState = document.createElement("span");
+    const resultCacheState = item.cache?.hit
+      ? `缓存命中${item.cache.hitCount ? ` · 第 ${formatNumber(item.cache.hitCount)} 次` : ""}`
+      : `${formatNumber(item.timing?.providerCallCount)} 次 Provider 调用`;
+    const providerCacheTokens = Math.max(
+      0,
+      Number(item.usage?.cacheReadInputTokens) || 0,
+    );
+    cacheState.textContent = providerCacheTokens
+      ? `${resultCacheState} · Prompt Cache ${formatNumber(providerCacheTokens)} Token`
+      : resultCacheState;
+    usageCell.append(tokenCount, cacheState);
+
+    record.append(time, identity, status, usageCell);
+    if (item.error) {
+      const error = document.createElement("p");
+      error.className = "history-error";
+      error.textContent = item.error;
+      record.append(error);
+    }
+    elements.historyList.append(record);
+  }
+}
+
+async function loadHistory({showLoading = false} = {}) {
+  if (showLoading) {
+    setButtonLoading(elements.refreshHistory, true, "正在刷新…");
+  }
+  try {
+    const payload = await requestJson(`${API_BASE}/executions?limit=50&offset=0`);
+    renderHistory(payload);
+  } catch (error) {
+    elements.historyState.textContent = `调用记录读取失败：${error.message}`;
+  } finally {
+    if (showLoading) {
+      setButtonLoading(elements.refreshHistory, false, "");
+    }
   }
 }
 
@@ -189,6 +334,7 @@ function selectProvider(providerId) {
   elements.modelsPath.value = provider.modelsPath;
   elements.apiKey.value = "";
   elements.timeoutSeconds.value = String(provider.timeoutSeconds);
+  elements.maxConcurrency.value = String(provider.maxConcurrency);
   elements.transportRetries.value = String(provider.transportRetries);
   elements.credentialState.textContent = provider.credentialConfigured
     ? "Key 已配置；留空将使用现有值"
@@ -229,6 +375,7 @@ function newProvider() {
   elements.applyProvider.disabled = true;
   applyPreset("custom", {updateProviderId: true});
   elements.timeoutSeconds.value = "60";
+  elements.maxConcurrency.value = "8";
   elements.transportRetries.value = "2";
   setResult("选择服务商并填写 Key 后，可以先获取模型，再测试连接。", "neutral");
   renderProviderList();
@@ -252,6 +399,7 @@ function collectConnectionDraft() {
     chatCompletionsPath: elements.chatPath.value.trim() || "/chat/completions",
     modelsPath: elements.modelsPath.value.trim() || "/models",
     timeoutSeconds: Number(elements.timeoutSeconds.value),
+    maxConcurrency: Number(elements.maxConcurrency.value),
     transportRetries: Number(elements.transportRetries.value),
   };
   if (elements.apiKey.value) {
@@ -281,6 +429,7 @@ function reportConnectionValidity() {
     elements.chatPath,
     elements.modelsPath,
     elements.timeoutSeconds,
+    elements.maxConcurrency,
     elements.transportRetries,
   ];
   for (const control of controls) {
@@ -335,12 +484,16 @@ async function testProvider() {
     });
     state.verificationToken = payload.verificationToken;
     elements.applyProvider.disabled = false;
-    setResult(`连接测试通过，耗时 ${payload.elapsedMs} ms。现在可以保存并激活。`, "success");
+    const tokenNote = payload.usage?.available
+      ? `，本次 ${formatNumber(payload.usage.totalTokens)} Token`
+      : "，Provider 未返回 Token usage";
+    setResult(`连接测试通过，耗时 ${payload.elapsedMs} ms${tokenNote}。现在可以保存并激活。`, "success");
   } catch (error) {
     state.verificationToken = "";
     setResult(error.message, "error");
   } finally {
     setButtonLoading(elements.testProvider, false, "");
+    loadHistory();
   }
 }
 
@@ -376,6 +529,7 @@ async function waitForRestart() {
       const health = await response.json();
       if (response.ok && health.app === "model-processing-engine" && health.status === "ok") {
         await loadConfig();
+        await loadHistory();
         elements.restartOverlay.hidden = true;
         setResult("配置已经生效，MPE 服务已恢复。", "success");
         return;
@@ -437,8 +591,10 @@ elements.toggleKey.addEventListener("click", () => {
   elements.apiKey.type = showing ? "password" : "text";
   elements.toggleKey.textContent = showing ? "显示" : "隐藏";
 });
+elements.refreshHistory.addEventListener("click", () => loadHistory({showLoading: true}));
 
 loadConfig().catch((error) => {
   setServiceState(false, "管理服务不可用");
   setResult(error.message, "error");
 });
+loadHistory();

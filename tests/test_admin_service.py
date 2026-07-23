@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from model_processing_engine.exceptions import ProviderError
 from model_processing_engine.service import create_app
 from model_processing_engine.settings import Settings
 
@@ -151,6 +152,64 @@ class AdminServiceTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["models"], ["schema-sample-v1"])
+
+    def test_admin_provider_test_is_written_to_redacted_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings, engine = self._runtime(Path(temp_dir))
+            client = TestClient(
+                create_app(engine=engine, settings=settings, restart_scheduler=lambda _settings: None),
+                client=("127.0.0.1", 50000),
+            )
+            headers = {"Host": "127.0.0.1:8787"}
+            csrf = client.get("/v1/admin/config", headers=headers).json()["csrfToken"]
+            mutation_headers = {
+                **headers,
+                "Origin": "http://127.0.0.1:8787",
+                "X-MPE-CSRF": csrf,
+            }
+
+            tested = client.post(
+                "/v1/admin/providers/test",
+                json={"providerId": "mock", "type": "mock", "model": "schema-sample-v1"},
+                headers=mutation_headers,
+            )
+            history = client.get("/v1/admin/executions", headers=headers)
+
+            self.assertEqual(tested.status_code, 200)
+            self.assertTrue(tested.json()["auditExecutionId"].startswith("probe_"))
+            self.assertEqual(history.status_code, 200)
+            self.assertEqual(history.json()["summary"]["providerTests"], 1)
+            self.assertEqual(history.json()["items"][0]["kind"], "provider_test")
+            self.assertNotIn("result", history.text)
+
+    def test_failed_admin_provider_test_is_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings, engine = self._runtime(Path(temp_dir))
+            client = TestClient(
+                create_app(engine=engine, settings=settings, restart_scheduler=lambda _settings: None),
+                client=("127.0.0.1", 50000),
+            )
+            headers = {"Host": "127.0.0.1:8787"}
+            csrf = client.get("/v1/admin/config", headers=headers).json()["csrfToken"]
+            mutation_headers = {
+                **headers,
+                "Origin": "http://127.0.0.1:8787",
+                "X-MPE-CSRF": csrf,
+            }
+            with patch(
+                "model_processing_engine.admin_config.AdminConfigManager.test_provider",
+                side_effect=ProviderError("probe failed"),
+            ):
+                failed = client.post(
+                    "/v1/admin/providers/test",
+                    json={"providerId": "mock", "type": "mock", "model": "schema-sample-v1"},
+                    headers=mutation_headers,
+                )
+            history = client.get("/v1/admin/executions", headers=headers).json()
+
+            self.assertEqual(failed.status_code, 502)
+            self.assertEqual(history["summary"]["failed"], 1)
+            self.assertEqual(history["items"][0]["error"], "probe failed")
 
     def test_admin_is_disabled_in_remote_mode_and_for_foreign_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

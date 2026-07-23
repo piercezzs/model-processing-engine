@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from model_processing_engine.exceptions import ConfigurationError
+from model_processing_engine.exceptions import ConfigurationError, ProviderEmptyContentError
 from model_processing_engine.providers.base import ProviderConfig, ProviderRegistry
 from model_processing_engine.providers.openai_compatible import OpenAICompatibleProvider
 from model_processing_engine.settings import PACKAGE_PROVIDER_CONFIG, load_settings
@@ -82,6 +82,60 @@ class SettingsAndProviderTests(unittest.TestCase):
                     "prompt_tokens": 3,
                     "completion_tokens": 2,
                     "total_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 2},
+                    "prompt_cache_hit_tokens": 1,
+                },
+            }
+        )
+        model_payload = {
+            "outputSchema": {"type": "object"},
+            "taxonomy": {"types": ["book"]},
+            "input": {"text": "hello"},
+        }
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                result = provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload=model_payload,
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=None,
+                )
+        self.assertEqual(result.content, {"answer": True})
+        self.assertEqual(result.usage["totalTokens"], 5)
+        self.assertEqual(result.usage["cacheReadInputTokens"], 2)
+        request_payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        serialized_model_payload = json.loads(
+            request_payload["messages"][1]["content"]
+        )
+        self.assertEqual(
+            list(serialized_model_payload),
+            ["outputSchema", "taxonomy", "input"],
+        )
+
+    def test_openai_compatible_provider_parses_deepseek_prompt_cache_usage(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {
+                "choices": [{"message": {"content": '{"answer":true}'}}],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 2,
+                    "total_tokens": 10,
+                    "prompt_cache_hit_tokens": 6,
+                    "prompt_cache_miss_tokens": 2,
                 },
             }
         )
@@ -98,8 +152,48 @@ class SettingsAndProviderTests(unittest.TestCase):
                     temperature=0,
                     max_tokens=None,
                 )
-        self.assertEqual(result.content, {"answer": True})
-        self.assertEqual(result.usage["totalTokens"], 5)
+
+        self.assertEqual(result.usage["cacheReadInputTokens"], 6)
+
+    def test_empty_provider_content_preserves_usage_for_audit(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {
+                "choices": [{"message": {"content": ""}}],
+                "usage": {
+                    "prompt_tokens": 6,
+                    "completion_tokens": 1,
+                    "total_tokens": 7,
+                    "prompt_cache_hit_tokens": 4,
+                },
+            }
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ):
+                with self.assertRaises(ProviderEmptyContentError) as raised:
+                    provider.call_json(
+                        model="",
+                        system_prompt="Return JSON",
+                        input_payload={},
+                        output_schema={"type": "object"},
+                        temperature=0,
+                        max_tokens=32,
+                    )
+
+        self.assertEqual(raised.exception.usage["totalTokens"], 7)
+        self.assertEqual(raised.exception.usage["cacheReadInputTokens"], 4)
+        self.assertEqual(raised.exception.attempts, 1)
 
     def test_openai_compatible_provider_adds_non_conflicting_extra_body(self) -> None:
         provider = OpenAICompatibleProvider(
@@ -219,6 +313,7 @@ class SettingsAndProviderTests(unittest.TestCase):
         registry = ProviderRegistry({"test": provider}, default_provider_id="test")
         descriptor = registry.descriptors()[0]
         self.assertEqual(descriptor["availableModels"], ["model-one"])
+        self.assertEqual(descriptor["maxConcurrency"], 8)
         self.assertNotIn("apiKeyEnv", descriptor)
 
 

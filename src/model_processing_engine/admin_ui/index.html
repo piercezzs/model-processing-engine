@@ -106,6 +106,11 @@
                 <input id="timeout-seconds" name="timeoutSeconds" type="number" min="1" max="600" value="60">
               </label>
               <label class="field">
+                <span>最大并发请求数</span>
+                <input id="max-concurrency" name="maxConcurrency" type="number" min="1" max="64" value="8">
+                <small>该平台同时在途的模型请求上限；实际并发不会超过待处理数量。</small>
+              </label>
+              <label class="field">
                 <span>传输重试次数</span>
                 <input id="transport-retries" name="transportRetries" type="number" min="0" max="5" value="2">
               </label>
@@ -130,6 +135,48 @@
         </form>
       </section>
     </main>
+
+    <section class="history-panel" aria-labelledby="history-title">
+      <div class="history-heading">
+        <div>
+          <p class="section-label">EXECUTION HISTORY</p>
+          <h2 id="history-title">模型调用记录</h2>
+        </div>
+        <button class="compact-button" id="refresh-history" type="button">刷新记录</button>
+      </div>
+
+      <div class="history-metrics" aria-label="模型调用汇总">
+        <div class="history-metric">
+          <span>执行记录</span>
+          <strong id="history-total">0</strong>
+        </div>
+        <div class="history-metric">
+          <span>已统计 Token</span>
+          <strong id="history-tokens">0</strong>
+          <small id="history-usage-coverage">0/0 条提供 usage</small>
+        </div>
+        <div class="history-metric">
+          <span>MPE 结果缓存</span>
+          <strong id="history-cache-hits">0</strong>
+          <small>跳过 Provider 的执行数</small>
+        </div>
+        <div class="history-metric">
+          <span>Provider Prompt Cache</span>
+          <strong id="history-provider-cache-tokens">0</strong>
+          <small id="history-provider-cache-coverage">0 条命中 · 0.0% 输入</small>
+        </div>
+        <div class="history-metric">
+          <span>Provider 调用</span>
+          <strong id="history-provider-calls">0</strong>
+          <small id="history-transport-retries">0 次传输重试</small>
+        </div>
+      </div>
+
+      <p class="history-state" id="history-state" role="status" aria-live="polite">
+        正在读取调用记录…
+      </p>
+      <div class="history-list" id="history-list"></div>
+    </section>
   </div>
 
   <div class="restart-overlay" id="restart-overlay" hidden>

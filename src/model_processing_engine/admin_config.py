@@ -13,10 +13,10 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from .exceptions import ConfigurationError, ProviderEmptyContentError
+from .exceptions import ConfigurationError, ProviderEmptyContentError, ProviderError
 from .file_store import atomic_write_text
 from .project_environment import read_env_file, update_project_environment
-from .providers.base import ProviderConfig, load_provider_registry_data
+from .providers.base import ProviderCallResult, ProviderConfig, load_provider_registry_data
 from .providers.mock import MockProvider
 from .providers.openai_compatible import OpenAICompatibleProvider
 
@@ -82,6 +82,7 @@ class ProviderConnectionDraft(BaseModel):
     api_key: SecretStr | None = Field(default=None, alias="apiKey", max_length=16_384)
     timeout_seconds: int = Field(default=60, alias="timeoutSeconds", ge=1, le=600)
     transport_retries: int = Field(default=2, alias="transportRetries", ge=0, le=5)
+    max_concurrency: int = Field(default=8, alias="maxConcurrency", ge=1, le=64)
 
     @field_validator("provider_id")
     @classmethod
@@ -201,6 +202,7 @@ class AdminConfigManager:
                             if value.get("transportRetries") is not None
                             else 2
                         ),
+                        "maxConcurrency": int(value.get("maxConcurrency") or 8),
                         "credentialConfigured": bool(
                             credential_env and env_values.get(credential_env, "").strip()
                         ),
@@ -237,6 +239,7 @@ class AdminConfigManager:
                 api_key_env=self._credential_env(draft.provider_id),
                 timeout_seconds=draft.timeout_seconds,
                 transport_retries=draft.transport_retries,
+                max_concurrency=draft.max_concurrency,
                 cache_identity=f"{draft.provider_id}-models",
             )
             provider = OpenAICompatibleProvider(
@@ -263,6 +266,9 @@ class AdminConfigManager:
                 "providerId": draft.provider_id,
                 "model": draft.model or "schema-sample-v1",
                 "elapsedMs": result["elapsedMs"],
+                "usage": dict(result.get("usage") or {}),
+                "providerCallCount": int(result.get("providerCallCount") or 0),
+                "transportRetries": int(result.get("transportRetries") or 0),
                 "verificationToken": token,
                 "expiresInSeconds": TEST_TOKEN_TTL_SECONDS,
             }
@@ -306,6 +312,7 @@ class AdminConfigManager:
                 "cacheIdentity": f"{draft.provider_id}-local-{secrets.token_hex(8)}",
                 "availableModels": available_models,
                 "capabilities": ["structured_json"],
+                "maxConcurrency": draft.max_concurrency,
                 **(
                     {
                         "baseUrl": draft.base_url.rstrip("/"),
@@ -400,7 +407,7 @@ class AdminConfigManager:
         return self._credential_env(provider_id)
 
     @staticmethod
-    def _call_provider(draft: ProviderDraft, *, api_key: str) -> dict[str, int]:
+    def _call_provider(draft: ProviderDraft, *, api_key: str) -> dict[str, Any]:
         model = draft.model or "schema-sample-v1"
         config = ProviderConfig(
             id=draft.provider_id,
@@ -411,6 +418,7 @@ class AdminConfigManager:
             api_key_env=AdminConfigManager._credential_env(draft.provider_id),
             timeout_seconds=draft.timeout_seconds,
             transport_retries=draft.transport_retries,
+            max_concurrency=draft.max_concurrency,
             cache_identity=f"{draft.provider_id}-test",
             available_models=(model,),
         )
@@ -426,8 +434,13 @@ class AdminConfigManager:
             "temperature": 0,
             "max_tokens": 256,
         }
+        provider_calls: list[dict[str, Any]] = []
         if draft.type == "mock":
-            call = MockProvider(config).call_json(**call_arguments)
+            try:
+                call = MockProvider(config).call_json(**call_arguments)
+            except ProviderError as exc:
+                exc.audit_calls = [_probe_error_record(exc)]
+                raise
         else:
             provider = OpenAICompatibleProvider(
                 config,
@@ -445,12 +458,41 @@ class AdminConfigManager:
                         extra_body=extra_body,
                     )
                     break
-                except ProviderEmptyContentError:
+                except ProviderEmptyContentError as exc:
+                    provider_calls.append(_probe_error_record(exc))
                     if attempt == 1:
+                        exc.audit_calls = list(provider_calls)
                         raise
+                except ProviderError as exc:
+                    provider_calls.extend(exc.audit_calls or [_probe_error_record(exc)])
+                    exc.audit_calls = list(provider_calls)
+                    raise
         if not isinstance(call.content, dict):
             raise ConfigurationError("Provider test did not return a JSON object")
-        return {"elapsedMs": call.elapsed_ms}
+        provider_calls.append(_probe_success_record(call))
+        usage_fields = (
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "cacheReadInputTokens",
+        )
+        usage = {
+            "available": any(bool(item["usage"].get("available")) for item in provider_calls),
+            **{
+                field: sum(int(item["usage"].get(field) or 0) for item in provider_calls)
+                for field in usage_fields
+            },
+            "source": "provider_probe_calls",
+        }
+        return {
+            "elapsedMs": sum(int(item["elapsedMs"]) for item in provider_calls),
+            "usage": usage,
+            "providerCallCount": len(provider_calls),
+            "transportRetries": sum(
+                max(0, int(item["attempts"]) - 1) for item in provider_calls
+            ),
+            "providerCalls": provider_calls,
+        }
 
     @staticmethod
     def _credential_env(provider_id: str) -> str:
@@ -482,3 +524,23 @@ def _infer_preset_id(provider_type: str, base_url: str) -> ProviderPresetId:
         if normalized == str(preset["baseUrl"]).rstrip("/").casefold():
             return preset["id"]
     return "custom"
+
+
+def _probe_success_record(call: ProviderCallResult) -> dict[str, Any]:
+    return {
+        "status": "succeeded",
+        "usage": dict(call.usage),
+        "attempts": max(0, int(call.attempts)),
+        "elapsedMs": max(0, int(call.elapsed_ms)),
+        "error": "",
+    }
+
+
+def _probe_error_record(error: ProviderError) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "usage": dict(error.usage),
+        "attempts": max(0, int(error.attempts)),
+        "elapsedMs": max(0, int(error.elapsed_ms)),
+        "error": error.audit_message,
+    }

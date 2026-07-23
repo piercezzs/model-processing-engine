@@ -51,14 +51,23 @@ depends on contracts, cache, and providers; lower layers never import entrypoint
 
 ## Verification
 
-Before reporting implementation complete, run:
+The project-local verification script is the canonical completion entrypoint.
+Before reporting implementation complete, run it with the repository virtual
+environment:
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q src tests
-python -m model_processing_engine.cli task validate \
-  --task-dir examples/tasks/generic_summary
+# macOS / Linux
+.venv/bin/python scripts/verify_project.py
+
+# Windows
+.venv\Scripts\python scripts\verify_project.py
 ```
+
+Do not manually reconstruct the checks already owned by this script. Use
+`scripts/verify_project.py --runtime` when changes affect service startup,
+process management, HTTP routes, or served admin assets and a managed loopback
+service restart is within the approved task scope. Default verification must
+remain deterministic and must not restart the service.
 
 Real provider calls are optional acceptance checks and must never be required by
 the default test suite.

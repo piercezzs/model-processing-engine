@@ -80,13 +80,31 @@ class OpenAICompatibleProvider:
             method="POST",
         )
         started = time.perf_counter()
-        response, attempts = self._request_json(request)
-        content = _parse_json_content(_message_content(response))
+        try:
+            response, attempts = self._request_json(request)
+        except ProviderError as exc:
+            raise _provider_call_error(
+                exc,
+                usage=exc.usage,
+                attempts=exc.attempts,
+                elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            ) from exc
+        usage = _normalize_usage(response.get("usage"))
+        elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
+        try:
+            content = _parse_json_content(_message_content(response))
+        except ProviderError as exc:
+            raise _provider_call_error(
+                exc,
+                usage=usage,
+                attempts=attempts,
+                elapsed_ms=elapsed_ms,
+            ) from exc
         return ProviderCallResult(
             content=content,
-            usage=_normalize_usage(response.get("usage")),
+            usage=usage,
             attempts=attempts,
-            elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            elapsed_ms=elapsed_ms,
         )
 
     def list_models(self, *, models_path: str = "/models") -> dict[str, Any]:
@@ -155,7 +173,11 @@ class OpenAICompatibleProvider:
                     if attempt < attempts:
                         time.sleep(0.1 * attempt)
                         continue
-                raise ProviderError(f"Provider request failed with HTTP {exc.code}: {_preview(body)}") from exc
+                raise ProviderError(
+                    f"Provider request failed with HTTP {exc.code}: {_preview(body)}",
+                    attempts=attempt,
+                    audit_message=f"Provider request failed with HTTP {exc.code}",
+                ) from exc
             except _retryable_errors() as exc:
                 last_error = exc
                 if attempt < attempts:
@@ -165,13 +187,23 @@ class OpenAICompatibleProvider:
             try:
                 parsed = json.loads(body)
             except json.JSONDecodeError as exc:
-                raise ProviderError(f"Provider returned invalid response JSON: {_preview(body)}") from exc
+                raise ProviderError(
+                    f"Provider returned invalid response JSON: {_preview(body)}",
+                    attempts=attempt,
+                    audit_message="Provider returned invalid response JSON",
+                ) from exc
             if not isinstance(parsed, dict):
-                raise ProviderError("Provider response JSON is not an object")
+                raise ProviderError(
+                    "Provider response JSON is not an object",
+                    attempts=attempt,
+                    audit_message="Provider response JSON is not an object",
+                )
             return parsed, attempt
         raise ProviderError(
             f"Provider transport failed after {attempts} attempts: "
-            f"{last_error.__class__.__name__ if last_error else 'unknown error'}"
+            f"{last_error.__class__.__name__ if last_error else 'unknown error'}",
+            attempts=attempts,
+            audit_message=f"Provider transport failed after {attempts} attempts",
         ) from last_error
 
 
@@ -210,7 +242,10 @@ def _parse_json_content(content: str) -> dict[str, Any]:
             continue
         if isinstance(parsed, dict):
             return parsed
-    raise ProviderError(f"Provider returned non-JSON content: {_preview(content)}")
+    raise ProviderError(
+        f"Provider returned non-JSON content: {_preview(content)}",
+        audit_message="Provider returned non-JSON content",
+    )
 
 
 def _normalize_usage(value: Any) -> dict[str, Any]:
@@ -218,13 +253,18 @@ def _normalize_usage(value: Any) -> dict[str, Any]:
     input_tokens = _integer(raw.get("prompt_tokens"))
     output_tokens = _integer(raw.get("completion_tokens"))
     total_tokens = _integer(raw.get("total_tokens")) or input_tokens + output_tokens
-    details = raw.get("prompt_tokens_details") if isinstance(raw.get("prompt_tokens_details"), dict) else {}
+    details_value = raw.get("prompt_tokens_details")
+    details = details_value if isinstance(details_value, dict) else {}
+    cache_read_input_tokens = max(
+        _integer(details.get("cached_tokens")),
+        _integer(raw.get("prompt_cache_hit_tokens")),
+    )
     return {
         "available": bool(raw),
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
         "totalTokens": total_tokens,
-        "cacheReadInputTokens": _integer(details.get("cached_tokens")),
+        "cacheReadInputTokens": cache_read_input_tokens,
         "source": "provider_response" if raw else "provider_response_without_usage",
     }
 
@@ -267,6 +307,24 @@ def _open_without_redirects(request: urllib.request.Request, *, timeout: int) ->
 
 def _preview(value: str) -> str:
     return " ".join(value.split())[:300] or "<empty>"
+
+
+def _provider_call_error(
+    error: ProviderError,
+    *,
+    usage: dict[str, Any],
+    attempts: int,
+    elapsed_ms: int,
+) -> ProviderError:
+    error_type = ProviderEmptyContentError if isinstance(error, ProviderEmptyContentError) else ProviderError
+    return error_type(
+        str(error),
+        usage=usage,
+        attempts=attempts,
+        elapsed_ms=elapsed_ms,
+        audit_message=error.audit_message,
+        audit_calls=error.audit_calls,
+    )
 
 
 def _environment_credential(name: str) -> str:

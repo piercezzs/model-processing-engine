@@ -5,11 +5,13 @@ import ipaddress
 import os
 import secrets
 import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 
 from .admin_config import (
@@ -114,7 +116,7 @@ def create_app(
     def providers() -> dict[str, Any]:
         return {
             "providers": task_engine.providers.ids(),
-            "providerDetails": task_engine.providers.descriptors(),
+            "providerDetails": task_engine.provider_descriptors(),
             "defaultProviderId": task_engine.providers.default_provider_id,
         }
 
@@ -146,15 +148,52 @@ def create_app(
             "config": admin_manager.snapshot(),
         }
 
+    def history_payload(
+        *,
+        limit: int,
+        offset: int,
+        namespace: str | None,
+        status: str | None,
+    ) -> dict[str, Any]:
+        return task_engine.store.execution_history(
+            limit=limit,
+            offset=offset,
+            namespace=namespace,
+            status=status,
+        )
+
+    @app.get(f"/{API_VERSION}/admin/executions")
+    def admin_execution_history(
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        namespace: str | None = Query(default=None, max_length=256),
+        status: str | None = Query(default=None, pattern="^(queued|running|succeeded|failed)$"),
+    ) -> dict[str, Any]:
+        return history_payload(
+            limit=limit,
+            offset=offset,
+            namespace=namespace,
+            status=status,
+        )
+
     @app.post(f"/{API_VERSION}/admin/providers/test")
     def admin_test_provider(draft: ProviderDraft) -> dict[str, Any]:
         assert admin_manager is not None
         try:
-            return admin_manager.test_provider(draft)
+            result = admin_manager.test_provider(draft)
         except ConfigurationError as exc:
+            _record_provider_test(task_engine, draft, error=exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ProviderError as exc:
+            _record_provider_test(task_engine, draft, error=exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        audit_execution_id = _record_provider_test(task_engine, draft, result=result)
+        public_result = {
+            key: value
+            for key, value in result.items()
+            if key != "providerCalls"
+        }
+        return {**public_result, "auditExecutionId": audit_execution_id}
 
     @app.post(f"/{API_VERSION}/admin/providers/models")
     def admin_discover_models(draft: ModelDiscoveryRequest) -> dict[str, Any]:
@@ -222,6 +261,127 @@ def create_app(
 
 def _is_admin_path(path: str) -> bool:
     return path == "/admin" or path.startswith("/admin/") or path.startswith(f"/{API_VERSION}/admin/")
+
+
+def _record_provider_test(
+    engine: ModelProcessingEngine,
+    draft: ProviderDraft,
+    *,
+    result: dict[str, Any] | None = None,
+    error: Exception | None = None,
+) -> str:
+    now = datetime.now(timezone.utc).isoformat()
+    provider_calls = list((result or {}).get("providerCalls") or [])
+    if isinstance(error, ProviderError):
+        provider_calls = list(error.audit_calls or [{
+            "status": "failed",
+            "usage": dict(error.usage),
+            "attempts": error.attempts,
+            "elapsedMs": error.elapsed_ms,
+            "error": error.audit_message,
+        }])
+    usage = dict((result or {}).get("usage") or {})
+    if provider_calls:
+        usage_fields = (
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "cacheReadInputTokens",
+        )
+        usage = {
+            "available": any(
+                bool(call.get("usage", {}).get("available"))
+                for call in provider_calls
+            ),
+            **{
+                field: sum(
+                    max(0, int(call.get("usage", {}).get(field) or 0))
+                    for call in provider_calls
+                )
+                for field in usage_fields
+            },
+            "source": "provider_call_audit",
+        }
+    usage.setdefault("available", False)
+    usage.setdefault("inputTokens", 0)
+    usage.setdefault("outputTokens", 0)
+    usage.setdefault("totalTokens", 0)
+    usage.setdefault("cacheReadInputTokens", 0)
+    usage.setdefault("source", "provider_response_without_usage")
+    execution_id = "probe_" + uuid.uuid4().hex
+    elapsed_ms = (
+        sum(max(0, int(call.get("elapsedMs") or 0)) for call in provider_calls)
+        if provider_calls
+        else max(0, int((result or {}).get("elapsedMs") or 0))
+    )
+    provider_call_count = (
+        len(provider_calls)
+        if provider_calls
+        else max(0, int((result or {}).get("providerCallCount") or 0))
+    )
+    transport_retries = (
+        sum(
+            max(0, int(call.get("attempts") or 0) - 1)
+            for call in provider_calls
+        )
+        if provider_calls
+        else max(0, int((result or {}).get("transportRetries") or 0))
+    )
+    audit_error = (
+        error.audit_message
+        if isinstance(error, ProviderError)
+        else error.__class__.__name__
+        if error
+        else ""
+    )
+    engine.store.save_execution(
+        {
+            "schemaVersion": 1,
+            "executionId": execution_id,
+            "status": "failed" if error else "succeeded",
+            "task": {
+                "namespace": "_mpe",
+                "id": "provider_connection_test",
+                "version": "1",
+                "kind": "provider_test",
+            },
+            "provider": {
+                "id": draft.provider_id,
+                "model": draft.model or "schema-sample-v1",
+            },
+            "cache": {"mode": "disabled", "hit": False},
+            "usage": usage,
+            "timing": {
+                "createdAt": now,
+                "completedAt": now,
+                "elapsedMs": elapsed_ms,
+                "providerElapsedMs": elapsed_ms,
+                "providerCallCount": provider_call_count,
+                "transportRetries": transport_retries,
+            },
+            "progress": {"event": "failed" if error else "completed"},
+            "result": None,
+            "warnings": [],
+            "error": audit_error or None,
+        }
+    )
+    for index, call in enumerate(provider_calls, start=1):
+        engine.store.save_provider_call(
+            {
+                "callId": uuid.uuid4().hex,
+                "executionId": execution_id,
+                "purpose": "provider_test",
+                "sequence": index,
+                "providerId": draft.provider_id,
+                "model": draft.model or "schema-sample-v1",
+                "status": str(call.get("status") or "failed"),
+                "usage": dict(call.get("usage") or {}),
+                "attempts": int(call.get("attempts") or 0),
+                "elapsedMs": int(call.get("elapsedMs") or 0),
+                "error": str(call.get("error") or ""),
+            }
+        )
+    return execution_id
 
 
 def _loopback_host(value: str) -> bool:

@@ -20,6 +20,7 @@ class ProviderConfig:
     api_key_env: str = ""
     timeout_seconds: int = 60
     transport_retries: int = 2
+    max_concurrency: int = 8
     cache_identity: str = "1"
     available_models: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ("structured_json",)
@@ -92,6 +93,7 @@ class ProviderRegistry:
                 "defaultModel": provider.config.default_model,
                 "availableModels": list(provider.config.available_models),
                 "capabilities": list(provider.config.capabilities),
+                "maxConcurrency": provider.config.max_concurrency,
             }
             for provider in (self._providers[provider_id] for provider_id in self.ids())
         ]
@@ -145,6 +147,9 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         raise ConfigurationError(f"Provider {provider_id} timeoutSeconds must be 1-600")
     if not 0 <= retries <= 5:
         raise ConfigurationError(f"Provider {provider_id} transportRetries must be 0-5")
+    max_concurrency = int(value.get("maxConcurrency") or 8)
+    if not 1 <= max_concurrency <= 64:
+        raise ConfigurationError(f"Provider {provider_id} maxConcurrency must be 1-64")
     available_models = _string_tuple(
         value.get("availableModels", []),
         label="availableModels",
@@ -167,6 +172,7 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         api_key_env=str(value.get("apiKeyEnv") or "").strip(),
         timeout_seconds=timeout,
         transport_retries=retries,
+        max_concurrency=max_concurrency,
         cache_identity=str(value.get("cacheIdentity") or "1").strip(),
         available_models=available_models,
         capabilities=capabilities,

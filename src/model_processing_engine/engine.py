@@ -14,12 +14,12 @@ from jsonschema import Draft202012Validator
 from .cache import CacheRecord, SQLiteRuntimeStore
 from .canonical import digest_json, field_value
 from .contracts import ExecutionRequest, ResultEnvelope, TaskDefinition
-from .exceptions import ContractValidationError, ExecutionNotFoundError
+from .exceptions import ContractValidationError, ExecutionNotFoundError, ProviderError
 from .providers.base import ModelProvider, ProviderCallResult, ProviderRegistry
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
-ENGINE_CACHE_SCHEMA = "mpe-cache-v1"
+ENGINE_CACHE_SCHEMA = "mpe-cache-v2"
 
 
 class _SingleFlightManager:
@@ -55,8 +55,29 @@ class ModelProcessingEngine:
     ) -> None:
         self.providers = providers
         self.store = store
-        self._provider_slots = threading.BoundedSemaphore(max(1, max_provider_concurrency))
+        self.store.purge_cache_schema_mismatches(ENGINE_CACHE_SCHEMA)
+        service_limit = max(1, max_provider_concurrency)
+        self._provider_limits = {
+            provider_id: min(
+                service_limit,
+                self.providers.get(provider_id).config.max_concurrency,
+            )
+            for provider_id in self.providers.ids()
+        }
+        self._provider_slots = {
+            provider_id: threading.BoundedSemaphore(limit)
+            for provider_id, limit in self._provider_limits.items()
+        }
         self._single_flight = _SingleFlightManager()
+
+    def provider_descriptors(self) -> list[dict[str, Any]]:
+        descriptors = self.providers.descriptors()
+        for descriptor in descriptors:
+            provider_id = str(descriptor["id"])
+            configured = int(descriptor["maxConcurrency"])
+            descriptor["configuredMaxConcurrency"] = configured
+            descriptor["maxConcurrency"] = self._provider_limits[provider_id]
+        return descriptors
 
     def reserve(self, request: ExecutionRequest) -> ResultEnvelope:
         execution_id = uuid4().hex
@@ -144,6 +165,7 @@ class ModelProcessingEngine:
                             started_timer=started_timer,
                         )
                     result, usage, provider_report = self._run_provider(
+                        execution_id=execution_id,
                         task=request.task,
                         input_payload=request.input_payload,
                         provider=provider,
@@ -161,6 +183,7 @@ class ModelProcessingEngine:
                     )
             else:
                 result, usage, provider_report = self._run_provider(
+                    execution_id=execution_id,
                     task=request.task,
                     input_payload=request.input_payload,
                     provider=provider,
@@ -169,6 +192,14 @@ class ModelProcessingEngine:
                     max_tokens=max_tokens,
                     progress=progress,
                 )
+                if cache_allowed:
+                    self._write_cache(
+                        task=request.task,
+                        cache_key=cache_key,
+                        provider=provider,
+                        model=model,
+                        result=result,
+                    )
 
             envelope.update(
                 {
@@ -219,6 +250,7 @@ class ModelProcessingEngine:
     def _run_provider(
         self,
         *,
+        execution_id: str,
         task: TaskDefinition,
         input_payload: dict[str, Any],
         provider: ModelProvider,
@@ -231,6 +263,8 @@ class ModelProcessingEngine:
         if not batch.enabled:
             progress("provider_call_started", chunkIndex=1, chunkCount=1, processed=0)
             call = self._provider_call(
+                execution_id=execution_id,
+                sequence=1,
                 task=task,
                 input_payload=input_payload,
                 provider=provider,
@@ -261,6 +295,8 @@ class ModelProcessingEngine:
             chunk_input = copy.deepcopy(input_payload)
             chunk_input[batch.input_field] = chunk
             return index, self._provider_call(
+                execution_id=execution_id,
+                sequence=index + 1,
                 task=task,
                 input_payload=chunk_input,
                 provider=provider,
@@ -269,7 +305,12 @@ class ModelProcessingEngine:
                 max_tokens=max_tokens,
             )
 
-        with ThreadPoolExecutor(max_workers=batch.concurrency) as executor:
+        worker_count = min(
+            len(chunks),
+            batch.concurrency,
+            self._provider_limits[provider.config.id],
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(call_chunk, index, chunk): index
                 for index, chunk in enumerate(chunks)
@@ -292,6 +333,8 @@ class ModelProcessingEngine:
     def _provider_call(
         self,
         *,
+        execution_id: str,
+        sequence: int,
         task: TaskDefinition,
         input_payload: dict[str, Any],
         provider: ModelProvider,
@@ -300,20 +343,63 @@ class ModelProcessingEngine:
         max_tokens: int | None,
     ) -> ProviderCallResult:
         model_payload = {
-            "input": input_payload,
             "outputSchema": task.output_schema,
         }
         if task.taxonomy is not None:
             model_payload["taxonomy"] = task.taxonomy
-        with self._provider_slots:
-            return provider.call_json(
-                model=model,
-                system_prompt=task.prompt,
-                input_payload=model_payload,
-                output_schema=task.output_schema,
-                temperature=temperature,
-                max_tokens=max_tokens,
+        model_payload["input"] = input_payload
+        call_id = uuid4().hex
+        try:
+            with self._provider_slots[provider.config.id]:
+                call = provider.call_json(
+                    model=model,
+                    system_prompt=task.prompt,
+                    input_payload=model_payload,
+                    output_schema=task.output_schema,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+        except Exception as exc:
+            usage = dict(exc.usage) if isinstance(exc, ProviderError) else {}
+            attempts = exc.attempts if isinstance(exc, ProviderError) else 0
+            elapsed_ms = exc.elapsed_ms if isinstance(exc, ProviderError) else 0
+            audit_error = (
+                exc.audit_message
+                if isinstance(exc, ProviderError)
+                else exc.__class__.__name__
             )
+            self.store.save_provider_call(
+                {
+                    "callId": call_id,
+                    "executionId": execution_id,
+                    "purpose": "task",
+                    "sequence": sequence,
+                    "providerId": provider.config.id,
+                    "model": model,
+                    "status": "failed",
+                    "usage": usage,
+                    "attempts": attempts,
+                    "elapsedMs": elapsed_ms,
+                    "error": audit_error,
+                }
+            )
+            raise
+        self.store.save_provider_call(
+            {
+                "callId": call_id,
+                "executionId": execution_id,
+                "purpose": "task",
+                "sequence": sequence,
+                "providerId": provider.config.id,
+                "model": model,
+                "status": "succeeded",
+                "usage": call.usage,
+                "attempts": call.attempts,
+                "elapsedMs": call.elapsed_ms,
+                "error": "",
+            }
+        )
+        return call
 
     def _cache_key(
         self,
@@ -382,6 +468,7 @@ class ModelProcessingEngine:
             model=model,
             result=result,
             metadata={
+                "cacheSchema": ENGINE_CACHE_SCHEMA,
                 "taskDigest": task.digest,
                 "componentHashes": task.component_hashes,
                 "providerIdentityDigest": provider.config.digest,

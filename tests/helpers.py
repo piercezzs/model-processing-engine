@@ -74,17 +74,20 @@ def engine_with_mock(
     *,
     responder: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
     delay_seconds: float = 0,
+    provider_max_concurrency: int = 8,
+    service_max_concurrency: int = 64,
 ) -> tuple[ModelProcessingEngine, MockProvider]:
     config = ProviderConfig(
         id="mock",
         type="mock",
         default_model="mock-v1",
+        max_concurrency=provider_max_concurrency,
     )
     provider = MockProvider(config, responder=responder, delay_seconds=delay_seconds)
     registry = ProviderRegistry({"mock": provider}, default_provider_id="mock")
     engine = ModelProcessingEngine(
         providers=registry,
         store=SQLiteRuntimeStore(root / "runtime.sqlite"),
-        max_provider_concurrency=8,
+        max_provider_concurrency=service_max_concurrency,
     )
     return engine, provider

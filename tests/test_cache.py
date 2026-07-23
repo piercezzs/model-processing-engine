@@ -82,6 +82,58 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(record["status"], "failed")
             self.assertIn("interrupted", record["error"])
 
+    def test_execution_history_is_redacted_paginated_and_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
+            store.save_execution(
+                {
+                    "schemaVersion": 1,
+                    "executionId": "exec-1",
+                    "status": "succeeded",
+                    "task": {"namespace": "one", "id": "task", "version": "1"},
+                    "provider": {"id": "provider", "model": "model"},
+                    "cache": {"hit": False},
+                    "usage": {
+                        "available": True,
+                        "inputTokens": 4,
+                        "outputTokens": 3,
+                        "totalTokens": 7,
+                        "cacheReadInputTokens": 2,
+                    },
+                    "timing": {"providerCallCount": 1, "transportRetries": 1},
+                    "result": {"private": "content"},
+                }
+            )
+            store.save_execution(
+                {
+                    "schemaVersion": 1,
+                    "executionId": "exec-2",
+                    "status": "succeeded",
+                    "task": {"namespace": "one", "id": "task", "version": "1"},
+                    "provider": {"id": "provider", "model": "model"},
+                    "cache": {"hit": True, "hitCount": 2},
+                    "usage": {"available": False, "totalTokens": 0},
+                    "timing": {"providerCallCount": 0, "transportRetries": 0},
+                    "result": {"private": "cached"},
+                }
+            )
+
+            history = store.execution_history(limit=1, offset=0, namespace="one")
+
+            self.assertEqual(history["pagination"]["total"], 2)
+            self.assertTrue(history["pagination"]["hasMore"])
+            self.assertEqual(len(history["items"]), 1)
+            self.assertNotIn("result", history["items"][0])
+            self.assertEqual(history["summary"]["total"], 2)
+            self.assertEqual(history["summary"]["cacheHits"], 1)
+            self.assertEqual(history["summary"]["providerCacheHitExecutions"], 1)
+            self.assertEqual(history["summary"]["providerCallCount"], 1)
+            self.assertEqual(history["summary"]["usage"]["totalTokens"], 7)
+            self.assertEqual(
+                history["summary"]["usage"]["cacheReadInputTokens"],
+                2,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

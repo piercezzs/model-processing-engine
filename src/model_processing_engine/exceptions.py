@@ -12,6 +12,23 @@ class ContractValidationError(ModelProcessingError):
 class ProviderError(ModelProcessingError):
     """A provider could not complete a model request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: dict[str, object] | None = None,
+        attempts: int = 0,
+        elapsed_ms: int = 0,
+        audit_message: str = "",
+        audit_calls: list[dict[str, object]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.usage = dict(usage or {})
+        self.attempts = max(0, int(attempts))
+        self.elapsed_ms = max(0, int(elapsed_ms))
+        self.audit_message = (audit_message or " ".join(str(message).split()))[:240]
+        self.audit_calls = list(audit_calls or [])
+
 
 class ProviderEmptyContentError(ProviderError):
     """A provider completed a request but returned no assistant content."""

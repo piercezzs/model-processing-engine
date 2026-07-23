@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from model_processing_engine.cache import SQLiteRuntimeStore
+from model_processing_engine.engine import ENGINE_CACHE_SCHEMA
+from model_processing_engine.providers.base import ProviderCallResult
 
 from tests.helpers import engine_with_mock, execution_request, task_definition
 
@@ -13,6 +19,56 @@ def summary_responder(payload, _schema):
 
 
 class EngineTests(unittest.TestCase):
+    def test_engine_removes_result_cache_from_older_wire_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = SQLiteRuntimeStore(root / "runtime.sqlite")
+            common = {
+                "namespace": "test-project",
+                "task_id": "summary",
+                "task_version": "1",
+                "provider_id": "mock",
+                "model": "mock-v1",
+                "result": {"summary": "cached"},
+                "ttl_seconds": None,
+            }
+            store.put_cache(
+                **common,
+                key="legacy",
+                metadata={"cacheSchema": "mpe-cache-v1"},
+            )
+            store.put_cache(
+                **common,
+                key="current",
+                metadata={"cacheSchema": ENGINE_CACHE_SCHEMA},
+            )
+
+            engine, _provider = engine_with_mock(root)
+
+            self.assertEqual(engine.store.cache_count(), 1)
+            self.assertIsNone(engine.store.get_cache("test-project", "legacy"))
+            self.assertIsNotNone(engine.store.get_cache("test-project", "current"))
+
+    def test_provider_payload_places_stable_contract_before_variable_input(self) -> None:
+        captured_keys: list[list[str]] = []
+
+        def responder(payload, _schema):
+            captured_keys.append(list(payload))
+            return {"summary": payload["input"]["text"]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, _provider = engine_with_mock(
+                Path(temp_dir),
+                responder=responder,
+            )
+            task = task_definition().model_copy(
+                update={"taxonomy": {"types": {"book": {"sections": []}}}}
+            )
+            result = engine.execute(execution_request(task, {"text": "hello"}))
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(captured_keys, [["outputSchema", "taxonomy", "input"]])
+
     def test_exact_cache_avoids_second_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             engine, provider = engine_with_mock(Path(temp_dir), responder=summary_responder)
@@ -25,12 +81,38 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(provider.call_count, 1)
 
     def test_force_refresh_bypasses_cache(self) -> None:
+        responses = iter(("original", "refreshed"))
+
+        def responder(_payload, _schema):
+            return {"summary": next(responses)}
+
         with tempfile.TemporaryDirectory() as temp_dir:
-            engine, provider = engine_with_mock(Path(temp_dir), responder=summary_responder)
+            engine, provider = engine_with_mock(Path(temp_dir), responder=responder)
             task = task_definition()
             engine.execute(execution_request(task))
             refreshed = engine.execute(execution_request(task, runtime={"forceRefresh": True}))
+            cached = engine.execute(execution_request(task))
             self.assertFalse(refreshed.cache["hit"])
+            self.assertEqual(refreshed.result, {"summary": "refreshed"})
+            self.assertTrue(cached.cache["hit"])
+            self.assertEqual(cached.result, {"summary": "refreshed"})
+            self.assertEqual(provider.call_count, 2)
+
+    def test_failed_force_refresh_preserves_previous_cache(self) -> None:
+        responses = iter(({"summary": "original"}, {"invalid": True}))
+
+        def responder(_payload, _schema):
+            return next(responses)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir), responder=responder)
+            task = task_definition()
+            engine.execute(execution_request(task))
+            refreshed = engine.execute(execution_request(task, runtime={"forceRefresh": True}))
+            cached = engine.execute(execution_request(task))
+            self.assertEqual(refreshed.status, "failed")
+            self.assertTrue(cached.cache["hit"])
+            self.assertEqual(cached.result, {"summary": "original"})
             self.assertEqual(provider.call_count, 2)
 
     def test_prompt_and_model_are_mandatory_cache_identity(self) -> None:
@@ -112,6 +194,32 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(provider.call_count, 1)
             self.assertEqual(engine.store.cache_count(), 0)
 
+    def test_provider_usage_is_audited_before_output_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir))
+            provider.call_json = lambda **_kwargs: ProviderCallResult(
+                content={"wrong": True},
+                usage={
+                    "available": True,
+                    "inputTokens": 8,
+                    "outputTokens": 5,
+                    "totalTokens": 13,
+                    "cacheReadInputTokens": 0,
+                },
+                attempts=2,
+                elapsed_ms=12,
+            )
+
+            result = engine.execute(execution_request(task_definition()))
+            history = engine.store.execution_history()
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(history["summary"]["providerCallCount"], 1)
+            self.assertEqual(history["summary"]["transportRetries"], 1)
+            self.assertEqual(history["summary"]["usage"]["totalTokens"], 13)
+            self.assertEqual(history["items"][0]["error"], "ContractValidationError")
+            self.assertNotIn("result", history["items"][0])
+
     def test_sensitive_result_is_returned_but_not_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             engine, _provider = engine_with_mock(Path(temp_dir), responder=summary_responder)
@@ -136,6 +244,51 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(all(result.status == "succeeded" for result in results))
             self.assertEqual(provider.call_count, 1)
             self.assertEqual(sum(bool(result.cache["hit"]) for result in results), 7)
+
+    def test_provider_concurrency_is_bounded_by_provider_configuration(self) -> None:
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def responder(payload, _schema):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return {"summary": payload["input"]["text"]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(
+                Path(temp_dir),
+                responder=responder,
+                provider_max_concurrency=2,
+            )
+            task = task_definition(cache_policy={"mode": "disabled"})
+            requests = [
+                execution_request(task, {"text": str(index)})
+                for index in range(6)
+            ]
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                results = list(executor.map(engine.execute, requests))
+
+            self.assertTrue(all(result.status == "succeeded" for result in results))
+            self.assertEqual(provider.call_count, 6)
+            self.assertEqual(peak, 2)
+            self.assertEqual(engine.provider_descriptors()[0]["maxConcurrency"], 2)
+
+    def test_service_concurrency_ceiling_reduces_effective_provider_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, _provider = engine_with_mock(
+                Path(temp_dir),
+                provider_max_concurrency=6,
+                service_max_concurrency=3,
+            )
+            descriptor = engine.provider_descriptors()[0]
+            self.assertEqual(descriptor["configuredMaxConcurrency"], 6)
+            self.assertEqual(descriptor["maxConcurrency"], 3)
 
     def test_batch_execution_merges_items_in_input_order(self) -> None:
         def responder(payload, _schema):

@@ -39,6 +39,20 @@ input identity. Namespaces never share entries.
 Cached model output is disposable computation reuse. Durable business results
 remain owned and stored by the caller.
 
+Provider prompt caching is a separate upstream optimization. The engine places
+the stable task output schema and optional taxonomy before caller-specific input
+in the serialized Provider payload so prefix-based caches can reuse the largest
+safe task-owned prefix. OpenAI-style `prompt_tokens_details.cached_tokens` and
+DeepSeek-style `prompt_cache_hit_tokens` are normalized into
+`cacheReadInputTokens`; this usage never counts as an MPE result-cache hit.
+The engine cache schema participates in every result-cache key and is also
+stored in cache metadata. Engine construction removes cache entries from older
+wire schemas; execution history remains untouched.
+
+A forced refresh bypasses cache reads and replaces the matching cache entry only
+after provider execution and output validation succeed. Failed refreshes do not
+destroy an existing valid entry.
+
 Sensitive tasks are synchronous only. Their result is returned in memory to the
 active caller and omitted from both cache entries and persisted execution
 records.
@@ -47,6 +61,18 @@ Each data directory has one service-process owner. Service startup recovers
 queued or running records left by the prior runtime. SDK and one-shot CLI engine
 construction does not perform recovery, so it cannot rewrite an active service's
 execution status.
+
+Execution history is the technical audit source for all normal task executions
+and Provider connection tests. The paginated history contract excludes result
+bodies and exposes only task identity, Provider/model identity, status, timing,
+retry, Token-usage, and cache metadata. Calling projects may retain execution
+IDs and batch-level aggregates, but do not own a competing complete ledger.
+`execution_records` remains the operation-level terminal snapshot, while
+`provider_call_records` stores one redacted row per real upstream request. The
+second layer preserves usage for batch chunks, probe retries, transport errors,
+and calls whose returned content later fails output-schema validation. Neither
+layer stores prompts, caller input, Provider response bodies, or credentials in
+the history query surface.
 
 ## Security Boundary
 
@@ -77,6 +103,21 @@ The HTTP path version comes from one runtime constant. Provider capability and
 configured-model declarations are exposed without credential environment names
 or secret values.
 
+## Provider Concurrency Ownership
+
+Concurrency limits belong to Provider configuration rather than caller Task
+Packs or business adapters. The engine keeps an independent bounded slot pool
+for each Provider, shared by synchronous calls, asynchronous executions, and
+Task Pack chunk workers. The effective limit is the smaller of the Provider's
+`maxConcurrency` value and the service-wide
+`MPE_MAX_PROVIDER_CONCURRENCY` safety ceiling.
+
+Worker counts are demand-driven. A single pending request occupies one slot;
+larger workloads can fill the configured limit, and excess calls wait without
+forcing the caller to coordinate with other projects using the same MPE
+process. Concurrency settings do not participate in cache identity because they
+change scheduling, not model semantics.
+
 ## Local Administration Boundary
 
 The loopback-only `/admin` surface manages deployment configuration, not caller
@@ -87,14 +128,17 @@ enabled.
 
 Provider tests use submitted credentials only in memory. A successful test
 issues a short-lived token bound to the exact Provider/model-list/default-model/
-key payload. Only a matching token can activate that payload. Provider presets
-are non-secret UI defaults; protocol type remains the runtime boundary. Model
-discovery uses the configured OpenAI-compatible `/models` path and submitted or
-previously stored credential only in memory, with manual model entry as the
-compatibility fallback. Activation atomically writes the project `.env` and
-ignored `config/providers.local.json`, then starts a detached control helper
-that uses the existing verified process manager to restart the service. The UI
-polls health and obtains a new CSRF token after recovery.
+key/concurrency payload. Only a matching token can activate that payload.
+Every test attempt is written to the redacted execution ledger; successful
+tests retain Provider-reported usage when available, while failed tests retain
+status and a bounded diagnostic without credentials or request content.
+Provider presets are non-secret UI defaults; protocol type remains the runtime
+boundary. Model discovery uses the configured OpenAI-compatible `/models` path
+and submitted or previously stored credential only in memory, with manual model
+entry as the compatibility fallback. Activation atomically writes the project
+`.env` and ignored `config/providers.local.json`, then starts a detached control
+helper that uses the existing verified process manager to restart the service.
+The UI polls health and obtains a new CSRF token after recovery.
 
 Secrets remain plaintext by the explicitly selected project `.env` policy, but
 the file is Git-ignored, mode `0600` on Unix, never returned over the API, and

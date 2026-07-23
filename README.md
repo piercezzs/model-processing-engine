@@ -69,6 +69,16 @@ configuration:
 http://127.0.0.1:8787/admin
 ```
 
+The same page shows a redacted execution history with aggregate Token usage,
+Provider call counts, retry counts, MPE result-cache hits, and Provider prompt
+cache usage. These are separate signals: an MPE result-cache hit skips the
+Provider call, while a Provider prompt-cache hit reuses input-prefix Token but
+still generates a new result. History rows never include model result bodies.
+Provider connection tests are recorded in the same technical ledger, including
+usage when the Provider returns it. Provider-call rows are captured before
+output-schema validation, so consumed Token remains accounted for even when
+returned JSON is rejected by the task contract.
+
 Choose a known service preset such as OpenAI or DeepSeek, or use the custom
 OpenAI-compatible option. Presets fill the protocol URL and endpoint paths but
 remain editable. After an API key is available, **Detect and fetch models**
@@ -79,7 +89,10 @@ a manually entered model ID.
 One Provider configuration can retain multiple discovered model IDs and one
 default execution model. Calling projects may still override that model in an
 execution request. Chat-completions protocol, request/list paths, timeout, and
-transport retry count live under advanced connection settings.
+transport retry count live under advanced connection settings. The same section
+also sets the Provider's maximum concurrent in-flight requests. Actual
+concurrency is demand-driven: one pending execution uses one slot, while larger
+workloads queue after the configured Provider limit.
 
 MPE first tests the exact submitted Provider, model list, default model, and key
 in memory. Only a matching, unexpired successful test can be saved and
@@ -161,6 +174,10 @@ Supported cache modes are:
 All modes also include namespace, complete Task Pack digest, provider identity,
 model, inference parameters, and semantic version. Cached output is disposable;
 the caller remains responsible for authoritative business data.
+
+`runtime.forceRefresh` bypasses cache reads. After a successful provider call and
+output validation, the engine replaces the matching reusable cache entry. A
+failed refresh leaves the previous cache entry unchanged.
 
 Sensitive tasks must execute synchronously. Their result is returned to that
 caller but omitted from persistent execution records as well as the result
@@ -260,6 +277,7 @@ Available routes:
 - `POST /v1/cache/cleanup`
 - `GET /admin` (loopback management page)
 - `GET /v1/admin/config` (masked local configuration)
+- `GET /v1/admin/executions` (loopback-only redacted history)
 - `POST /v1/admin/providers/test` (same-origin and CSRF protected)
 - `POST /v1/admin/providers/models` (in-memory Provider model discovery)
 - `POST /v1/admin/providers/apply` (same-origin and CSRF protected)
@@ -290,9 +308,12 @@ ID, and process ID so local service management can verify process identity.
 - `openai_compatible`: JSON chat-completions transport with bounded retry for
   rate-limit, server, timeout, and connection failures.
 
-Provider configuration may declare `availableModels` and `capabilities`. The
-`/v1/providers` response exposes those non-secret declarations while preserving
-the original provider-ID list for compatibility.
+Provider configuration may declare `availableModels`, `capabilities`, and
+`maxConcurrency`. The `/v1/providers` response exposes those non-secret
+declarations while preserving the original provider-ID list for compatibility.
+`maxConcurrency` is enforced independently for each Provider across all callers.
+The environment-level `MPE_MAX_PROVIDER_CONCURRENCY` remains a service-wide
+safety ceiling; the effective Provider limit is the smaller of the two.
 
 Credentials are referenced by environment-variable name in provider config.
 They must never be placed in Task Packs, request payloads, or committed files.
@@ -301,12 +322,30 @@ when that context changes; the value participates in technical cache identity.
 
 ## Verification
 
+Run the complete deterministic project verification:
+
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python -m compileall -q src tests
-.venv/bin/mpe task validate --task-dir examples/tasks/generic_summary
-.venv/bin/mpe status --root /tmp/mpe-verification-profile
+# macOS / Linux
+.venv/bin/python scripts/verify_project.py
+
+# Windows
+.venv\Scripts\python scripts\verify_project.py
 ```
+
+This runs the full unit suite, Python compilation, admin JavaScript syntax,
+`git diff --check`, and the neutral example Task Pack validation. It does not
+restart or mutate the running service.
+
+Add `--runtime` only when a managed-service restart is intended:
+
+```bash
+.venv/bin/python scripts/verify_project.py --runtime
+```
+
+Runtime mode uses the verified process manager to restart MPE, checks service
+identity and status, probes the redacted history contract, and confirms that
+the current admin script is served with cache-safe headers. Browser-based visual
+verification remains a separate manual or agent-assisted check.
 
 The automated suite uses only the mock provider or mocked transports. A real
 provider acceptance call is intentionally separate because it requires a local

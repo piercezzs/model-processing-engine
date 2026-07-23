@@ -6,6 +6,7 @@
       "type": "mock",
       "defaultModel": "schema-sample-v1",
       "cacheIdentity": "mock-v1",
+      "maxConcurrency": 8,
       "availableModels": ["schema-sample-v1"],
       "capabilities": ["structured_json"]
     }
