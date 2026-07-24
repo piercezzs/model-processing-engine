@@ -33,25 +33,25 @@ class ServiceAndCliTests(unittest.TestCase):
                 max_provider_concurrency=8,
                 max_request_bytes=2 * 1024 * 1024,
             )
-            client = TestClient(create_app(engine=engine, settings=settings))
-            task = task_definition()
-            sync_payload = execution_request(task).model_dump(by_alias=True)
-            response = client.post("/v1/executions", json=sync_payload)
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["status"], "succeeded")
-            self.assertEqual(client.get("/v1/executions").status_code, 405)
-            async_payload = execution_request(
-                task_definition(task_id="async-task"),
-                async_mode=True,
-            ).model_dump(by_alias=True)
-            queued = client.post("/v1/executions", json=async_payload).json()
-            self.assertEqual(queued["status"], "queued")
-            for _ in range(50):
-                record = client.get(f"/v1/executions/{queued['executionId']}").json()
-                if record["status"] in {"succeeded", "failed"}:
-                    break
-                time.sleep(0.01)
-            self.assertEqual(record["status"], "succeeded")
+            with TestClient(create_app(engine=engine, settings=settings)) as client:
+                task = task_definition()
+                sync_payload = execution_request(task).model_dump(by_alias=True)
+                response = client.post("/v1/executions", json=sync_payload)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "succeeded")
+                self.assertEqual(client.get("/v1/executions").status_code, 405)
+                async_payload = execution_request(
+                    task_definition(task_id="async-task"),
+                    async_mode=True,
+                ).model_dump(by_alias=True)
+                queued = client.post("/v1/executions", json=async_payload).json()
+                self.assertEqual(queued["status"], "queued")
+                for _ in range(50):
+                    record = client.get(f"/v1/executions/{queued['executionId']}").json()
+                    if record["status"] in {"succeeded", "failed"}:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(record["status"], "succeeded")
 
     def test_unknown_execution_returns_404(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -69,6 +69,74 @@ class ServiceAndCliTests(unittest.TestCase):
             )
             client = TestClient(create_app(engine=engine, settings=settings))
             self.assertEqual(client.get("/v1/executions/missing").status_code, 404)
+
+    def test_async_queue_recovers_persisted_request_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(root)
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="127.0.0.1",
+                port=8787,
+                allow_remote=False,
+                max_provider_concurrency=8,
+                max_request_bytes=2 * 1024 * 1024,
+                async_worker_count=1,
+            )
+            request = execution_request(
+                task_definition(task_id="recovered-task"),
+                async_mode=True,
+            )
+            reserved = engine.reserve(request, persist=False)
+            engine.store.enqueue_async_execution(
+                envelope=reserved.model_dump(by_alias=True),
+                request=request.model_dump(by_alias=True),
+                capacity=10,
+            )
+
+            with TestClient(create_app(engine=engine, settings=settings)) as client:
+                for _ in range(50):
+                    record = client.get(
+                        f"/v1/executions/{reserved.execution_id}"
+                    ).json()
+                    if record["status"] in {"succeeded", "failed"}:
+                        break
+                    time.sleep(0.01)
+
+            self.assertEqual(record["status"], "succeeded")
+            self.assertEqual(engine.store.async_queue_stats()["total"], 0)
+
+    def test_async_queue_returns_429_when_capacity_is_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(root, delay_seconds=0.2)
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="127.0.0.1",
+                port=8787,
+                allow_remote=False,
+                max_provider_concurrency=8,
+                max_request_bytes=2 * 1024 * 1024,
+                async_worker_count=1,
+                async_queue_capacity=1,
+            )
+            app = create_app(engine=engine, settings=settings)
+            with TestClient(app) as client:
+                first = execution_request(
+                    task_definition(task_id="first"),
+                    async_mode=True,
+                ).model_dump(by_alias=True)
+                second = execution_request(
+                    task_definition(task_id="second"),
+                    async_mode=True,
+                ).model_dump(by_alias=True)
+                self.assertEqual(client.post("/v1/executions", json=first).status_code, 200)
+                response = client.post("/v1/executions", json=second)
+                self.assertEqual(response.status_code, 429)
 
     def test_api_token_protects_non_health_routes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -161,6 +229,8 @@ class ServiceAndCliTests(unittest.TestCase):
             self.assertEqual(health["apiVersion"], "v1")
             self.assertEqual(health["instanceId"], settings.instance_id)
             self.assertGreater(health["processId"], 0)
+            self.assertEqual(health["asyncQueue"]["capacity"], 100)
+            self.assertEqual(health["asyncQueue"]["workers"], 4)
 
     def test_provider_endpoint_includes_configured_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

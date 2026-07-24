@@ -42,5 +42,9 @@ class ExecutionNotFoundError(ModelProcessingError):
     """An execution record does not exist."""
 
 
+class AsyncQueueFullError(ModelProcessingError):
+    """The persistent asynchronous execution queue has reached its capacity."""
+
+
 class ServiceManagerError(ModelProcessingError):
     """The managed local service could not be controlled safely."""

@@ -33,6 +33,7 @@ class ProviderConfig:
             "baseUrl": self.base_url,
             "chatCompletionsPath": self.chat_completions_path,
             "cacheIdentity": self.cache_identity,
+            "capabilities": list(self.capabilities),
         }
 
     @property
@@ -60,6 +61,8 @@ class ModelProvider(Protocol):
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        repair_feedback: str | None = None,
+        previous_output: dict[str, Any] | None = None,
     ) -> ProviderCallResult: ...
 
 

@@ -83,6 +83,7 @@ class ProviderConnectionDraft(BaseModel):
     timeout_seconds: int = Field(default=60, alias="timeoutSeconds", ge=1, le=600)
     transport_retries: int = Field(default=2, alias="transportRetries", ge=0, le=5)
     max_concurrency: int = Field(default=8, alias="maxConcurrency", ge=1, le=64)
+    native_json_schema: bool = Field(default=False, alias="nativeJsonSchema")
 
     @field_validator("provider_id")
     @classmethod
@@ -203,6 +204,13 @@ class AdminConfigManager:
                             else 2
                         ),
                         "maxConcurrency": int(value.get("maxConcurrency") or 8),
+                        "nativeJsonSchema": (
+                            "native_json_schema"
+                            in {
+                                str(item)
+                                for item in value.get("capabilities", [])
+                            }
+                        ),
                         "credentialConfigured": bool(
                             credential_env and env_values.get(credential_env, "").strip()
                         ),
@@ -311,7 +319,14 @@ class AdminConfigManager:
                 # without persisting a secret-derived identifier.
                 "cacheIdentity": f"{draft.provider_id}-local-{secrets.token_hex(8)}",
                 "availableModels": available_models,
-                "capabilities": ["structured_json"],
+                "capabilities": [
+                    "structured_json",
+                    *(
+                        ["native_json_schema"]
+                        if draft.native_json_schema
+                        else []
+                    ),
+                ],
                 "maxConcurrency": draft.max_concurrency,
                 **(
                     {
@@ -421,6 +436,14 @@ class AdminConfigManager:
             max_concurrency=draft.max_concurrency,
             cache_identity=f"{draft.provider_id}-test",
             available_models=(model,),
+            capabilities=(
+                "structured_json",
+                *(
+                    ("native_json_schema",)
+                    if draft.native_json_schema
+                    else ()
+                ),
+            ),
         )
         call_arguments = {
             "model": model,
@@ -430,6 +453,7 @@ class AdminConfigManager:
                 "type": "object",
                 "required": ["status"],
                 "properties": {"status": {"type": "string"}},
+                "additionalProperties": False,
             },
             "temperature": 0,
             "max_tokens": 256,

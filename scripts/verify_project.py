@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,9 @@ EXAMPLE_TASK = PROJECT_ROOT / "examples" / "tasks" / "generic_summary"
 ADMIN_SCRIPT_MARKERS = (
     "historyProviderCacheTokens",
     "historyTransportRetries",
+    "execution-stats?",
+    "renderModelBreakdown",
+    "nativeJsonSchema",
 )
 
 
@@ -170,6 +174,12 @@ def _verify_runtime_surface(environment: Mapping[str, str]) -> None:
     health, _headers = _read_json(f"{base_url}/v1/health")
     if health.get("status") != "ok" or health.get("app") != "model-processing-engine":
         raise VerificationError("health endpoint returned an unexpected service identity")
+    async_queue = health.get("asyncQueue")
+    if not isinstance(async_queue, dict):
+        raise VerificationError("health endpoint omitted asyncQueue")
+    for field in ("queued", "running", "total", "capacity", "workers"):
+        if field not in async_queue:
+            raise VerificationError(f"health endpoint omitted asyncQueue.{field}")
 
     history, _headers = _read_json(
         f"{base_url}/v1/admin/executions?limit=1"
@@ -182,11 +192,28 @@ def _verify_runtime_surface(environment: Mapping[str, str]) -> None:
         "providerCacheHitExecutions",
         "providerCallCount",
         "transportRetries",
+        "contractRepairs",
     ):
         if field not in summary:
             raise VerificationError(
                 f"admin execution history omitted summary.{field}"
             )
+
+    statistics, _headers = _read_json(
+        f"{base_url}/v1/admin/execution-stats"
+        f"?period=year&anchor={time.gmtime().tm_year}&timezone=UTC&kind=all"
+    )
+    if not isinstance(statistics.get("series"), list):
+        raise VerificationError("admin execution statistics omitted series")
+    if not isinstance(statistics.get("models"), list):
+        raise VerificationError("admin execution statistics omitted models")
+    if not isinstance(statistics.get("facets"), dict):
+        raise VerificationError("admin execution statistics omitted facets")
+
+    page, _headers = _read_text(f"{base_url}/admin")
+    for marker in ('data-view="providers"', 'data-view="executions"'):
+        if marker not in page:
+            raise VerificationError(f"served admin page omitted {marker}")
 
     script, headers = _read_text(f"{base_url}/admin/app.js")
     for marker in ADMIN_SCRIPT_MARKERS:
@@ -195,14 +222,57 @@ def _verify_runtime_surface(environment: Mapping[str, str]) -> None:
     if "no-store" not in headers.get("cache-control", ""):
         raise VerificationError("served admin script is missing no-store cache control")
 
+    from model_processing_engine.task_loader import load_task_pack
+
+    task = load_task_pack(EXAMPLE_TASK)
+    input_payload = json.loads(
+        (EXAMPLE_TASK / "input.example.json").read_text(encoding="utf-8")
+    )
+    queued, _headers = _post_json(
+        f"{base_url}/v1/executions",
+        {
+            "task": task.model_dump(by_alias=True),
+            "input": input_payload,
+            "runtime": {
+                "providerId": "mock",
+                "model": "schema-sample-v1",
+                "forceRefresh": True,
+            },
+            "asyncMode": True,
+        },
+        token=settings.api_token,
+    )
+    execution_id = str(queued.get("executionId") or "")
+    if queued.get("status") != "queued" or not execution_id:
+        raise VerificationError("async execution endpoint did not return a queued envelope")
+    deadline = time.monotonic() + 5
+    record: dict[str, object] = queued
+    while time.monotonic() < deadline:
+        record, _headers = _read_json(
+            f"{base_url}/v1/executions/{execution_id}",
+            token=settings.api_token,
+        )
+        if record.get("status") in {"succeeded", "failed"}:
+            break
+        time.sleep(0.05)
+    if record.get("status") != "succeeded":
+        raise VerificationError(
+            f"async execution did not succeed, got {record.get('status')!r}"
+        )
+
     print(
         "[verify] Runtime surface passed: "
-        f"{base_url}, PID {health.get('processId', 'unknown')}."
+        f"{base_url}, PID {health.get('processId', 'unknown')}, "
+        f"async execution {execution_id}."
     )
 
 
-def _read_json(url: str) -> tuple[dict[str, object], Mapping[str, str]]:
-    text, headers = _read_text(url)
+def _read_json(
+    url: str,
+    *,
+    token: str = "",
+) -> tuple[dict[str, object], Mapping[str, str]]:
+    text, headers = _read_text(url, token=token)
     try:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -212,13 +282,58 @@ def _read_json(url: str) -> tuple[dict[str, object], Mapping[str, str]]:
     return value, headers
 
 
-def _read_text(url: str) -> tuple[str, Mapping[str, str]]:
+def _read_text(
+    url: str,
+    *,
+    token: str = "",
+) -> tuple[str, Mapping[str, str]]:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    headers = {"Accept": "application/json, text/javascript"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json, text/javascript"},
+        headers=headers,
         method="GET",
     )
+    return _open_text(opener, request, url=url)
+
+
+def _post_json(
+    url: str,
+    payload: Mapping[str, object],
+    *,
+    token: str = "",
+) -> tuple[dict[str, object], Mapping[str, str]]:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    text, response_headers = _open_text(opener, request, url=url)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise VerificationError(f"{url} returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise VerificationError(f"{url} did not return a JSON object")
+    return value, response_headers
+
+
+def _open_text(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    *,
+    url: str,
+) -> tuple[str, Mapping[str, str]]:
     try:
         with opener.open(request, timeout=5) as response:
             return (

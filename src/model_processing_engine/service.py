@@ -4,8 +4,8 @@ import hmac
 import ipaddress
 import os
 import secrets
-import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 
+from .async_queue import PersistentAsyncExecutor
 from .admin_config import (
     AdminConfigManager,
     ApplyProviderRequest,
@@ -24,7 +25,12 @@ from .admin_restart import schedule_managed_restart
 from .contracts import ExecutionRequest
 from .constants import API_VERSION, APP_ID, VERSION
 from .engine import ModelProcessingEngine
-from .exceptions import ConfigurationError, ExecutionNotFoundError, ProviderError
+from .exceptions import (
+    AsyncQueueFullError,
+    ConfigurationError,
+    ExecutionNotFoundError,
+    ProviderError,
+)
 from .factory import build_default_engine
 from .settings import Settings, load_settings
 
@@ -36,14 +42,28 @@ def create_app(
     restart_scheduler: Callable[[Settings], None] | None = None,
 ) -> FastAPI:
     runtime = settings or load_settings()
-    task_engine = engine or build_default_engine(settings=runtime, recover_incomplete=True)
+    task_engine = engine or build_default_engine(settings=runtime)
+    async_executor = PersistentAsyncExecutor(
+        engine=task_engine,
+        store=task_engine.store,
+        worker_count=runtime.async_worker_count,
+        capacity=runtime.async_queue_capacity,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> Any:
+        async_executor.start()
+        try:
+            yield
+        finally:
+            async_executor.stop()
+
     app = FastAPI(
         title="Model Processing Engine",
         version=VERSION,
         description="Business-neutral runtime for externally defined model tasks.",
+        lifespan=lifespan,
     )
-    background_threads: set[threading.Thread] = set()
-    background_lock = threading.Lock()
     admin_manager = AdminConfigManager(runtime.project_dir) if runtime.project_dir else None
     admin_csrf_token = secrets.token_urlsafe(32)
     restart_service_later = restart_scheduler or schedule_managed_restart
@@ -110,6 +130,7 @@ def create_app(
             "processId": os.getpid(),
             "providers": task_engine.providers.ids(),
             "cacheEntries": task_engine.store.cache_count(),
+            "asyncQueue": async_executor.stats(),
         }
 
     @app.get(f"/{API_VERSION}/providers")
@@ -153,13 +174,25 @@ def create_app(
         limit: int,
         offset: int,
         namespace: str | None,
+        task_id: str | None,
         status: str | None,
+        kind: str | None,
+        provider_id: str | None,
+        model: str | None,
+        created_from: float | None,
+        created_to: float | None,
     ) -> dict[str, Any]:
         return task_engine.store.execution_history(
             limit=limit,
             offset=offset,
             namespace=namespace,
+            task_id=task_id,
             status=status,
+            kind=kind,
+            provider_id=provider_id,
+            model=model,
+            created_from=created_from,
+            created_to=created_to,
         )
 
     @app.get(f"/{API_VERSION}/admin/executions")
@@ -167,14 +200,66 @@ def create_app(
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         namespace: str | None = Query(default=None, max_length=256),
+        task_id: str | None = Query(default=None, alias="taskId", max_length=256),
         status: str | None = Query(default=None, pattern="^(queued|running|succeeded|failed)$"),
+        kind: str | None = Query(default=None, pattern="^(task|provider_test)$"),
+        provider_id: str | None = Query(
+            default=None,
+            alias="providerId",
+            max_length=256,
+        ),
+        model: str | None = Query(default=None, max_length=256),
+        created_from: float | None = Query(default=None, alias="createdFrom"),
+        created_to: float | None = Query(default=None, alias="createdTo"),
     ) -> dict[str, Any]:
         return history_payload(
             limit=limit,
             offset=offset,
             namespace=namespace,
+            task_id=task_id,
             status=status,
+            kind=kind,
+            provider_id=provider_id,
+            model=model,
+            created_from=created_from,
+            created_to=created_to,
         )
+
+    @app.get(f"/{API_VERSION}/admin/execution-stats")
+    def admin_execution_statistics(
+        period: str = Query(default="day", pattern="^(day|month|year)$"),
+        anchor: str = Query(min_length=4, max_length=10),
+        timezone_name: str = Query(
+            default="UTC",
+            alias="timezone",
+            min_length=1,
+            max_length=128,
+        ),
+        namespace: str | None = Query(default=None, max_length=256),
+        task_id: str | None = Query(default=None, alias="taskId", max_length=256),
+        status: str | None = Query(default=None, pattern="^(queued|running|succeeded|failed)$"),
+        kind: str = Query(default="task", pattern="^(task|provider_test|all)$"),
+        provider_id: str | None = Query(
+            default=None,
+            alias="providerId",
+            max_length=256,
+        ),
+        model: str | None = Query(default=None, max_length=256),
+    ) -> dict[str, Any]:
+        try:
+            return task_engine.store.execution_statistics(
+                period=period,
+                anchor=anchor,
+                timezone_name=timezone_name,
+                namespace=namespace,
+                task_id=task_id,
+                status=status,
+                kind=None if kind == "all" else kind,
+                provider_id=provider_id,
+                model=model,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post(f"/{API_VERSION}/admin/providers/test")
     def admin_test_provider(draft: ProviderDraft) -> dict[str, Any]:
@@ -222,23 +307,10 @@ def create_app(
     def execute(request: ExecutionRequest) -> dict[str, Any]:
         if not request.async_mode:
             return task_engine.execute(request).model_dump(by_alias=True)
-        reserved = task_engine.reserve(request)
-
-        def run() -> None:
-            try:
-                task_engine.execute(request, execution_id=reserved.execution_id)
-            finally:
-                with background_lock:
-                    background_threads.discard(threading.current_thread())
-
-        thread = threading.Thread(
-            target=run,
-            name=f"mpe-{reserved.execution_id[:12]}",
-            daemon=True,
-        )
-        with background_lock:
-            background_threads.add(thread)
-        thread.start()
+        try:
+            reserved = async_executor.enqueue(request)
+        except AsyncQueueFullError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         return reserved.model_dump(by_alias=True)
 
     @app.get(f"/{API_VERSION}/executions/{{execution_id}}")
@@ -254,7 +326,7 @@ def create_app(
 
     app.state.engine = task_engine
     app.state.settings = runtime
-    app.state.background_threads = background_threads
+    app.state.async_executor = async_executor
     app.state.admin_manager = admin_manager
     return app
 

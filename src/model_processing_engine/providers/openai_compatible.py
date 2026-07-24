@@ -37,9 +37,10 @@ class OpenAICompatibleProvider:
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        repair_feedback: str | None = None,
+        previous_output: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> ProviderCallResult:
-        del output_schema
         api_key = self._credential_resolver(self.config.api_key_env).strip()
         if not self.config.api_key_env or not api_key:
             raise ConfigurationError(
@@ -48,14 +49,46 @@ class OpenAICompatibleProvider:
         resolved_model = (model or self.config.default_model).strip()
         if not resolved_model:
             raise ConfigurationError(f"Provider {self.config.id} requires a model")
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(input_payload, ensure_ascii=False)},
+        ]
+        if repair_feedback:
+            if previous_output is not None:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _bounded_json(previous_output, maximum=50_000),
+                    }
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous JSON object failed the declared output contract. "
+                        f"Validation error: {_preview(repair_feedback)}. "
+                        "Return one corrected JSON object only. Preserve the task meaning "
+                        "and do not add fields outside the declared schema."
+                    ),
+                }
+            )
+        response_format: dict[str, Any]
+        if "native_json_schema" in self.config.capabilities:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "mpe_result",
+                    "strict": True,
+                    "schema": output_schema,
+                },
+            }
+        else:
+            response_format = {"type": "json_object"}
         payload: dict[str, Any] = {
             "model": resolved_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(input_payload, ensure_ascii=False)},
-            ],
+            "messages": messages,
             "temperature": temperature,
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
@@ -307,6 +340,11 @@ def _open_without_redirects(request: urllib.request.Request, *, timeout: int) ->
 
 def _preview(value: str) -> str:
     return " ".join(value.split())[:300] or "<empty>"
+
+
+def _bounded_json(value: dict[str, Any], *, maximum: int) -> str:
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return serialized if len(serialized) <= maximum else serialized[:maximum]
 
 
 def _provider_call_error(

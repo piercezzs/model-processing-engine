@@ -79,10 +79,16 @@ class ModelProcessingEngine:
             descriptor["maxConcurrency"] = self._provider_limits[provider_id]
         return descriptors
 
-    def reserve(self, request: ExecutionRequest) -> ResultEnvelope:
+    def reserve(
+        self,
+        request: ExecutionRequest,
+        *,
+        persist: bool = True,
+    ) -> ResultEnvelope:
         execution_id = uuid4().hex
         envelope = self._base_envelope(request.task, execution_id=execution_id, status="queued")
-        self._save_execution(request.task, envelope)
+        if persist:
+            self._save_execution(request.task, envelope)
         return ResultEnvelope.model_validate(envelope)
 
     def execute(
@@ -126,6 +132,11 @@ class ModelProcessingEngine:
                 request.runtime.max_tokens
                 if request.runtime.max_tokens is not None
                 else request.task.runtime_defaults.max_tokens
+            )
+            contract_retries = (
+                request.runtime.contract_retries
+                if request.runtime.contract_retries is not None
+                else request.task.runtime_defaults.contract_retries
             )
             envelope["provider"] = {
                 "id": provider.config.id,
@@ -172,6 +183,7 @@ class ModelProcessingEngine:
                         model=model,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        contract_retries=contract_retries,
                         progress=progress,
                     )
                     self._write_cache(
@@ -190,6 +202,7 @@ class ModelProcessingEngine:
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    contract_retries=contract_retries,
                     progress=progress,
                 )
                 if cache_allowed:
@@ -222,6 +235,7 @@ class ModelProcessingEngine:
                     "providerElapsedMs": provider_report["providerElapsedMs"],
                     "providerCallCount": provider_report["providerCallCount"],
                     "transportRetries": provider_report["transportRetries"],
+                    "contractRepairs": provider_report["contractRepairs"],
                 }
             )
         except Exception as exc:
@@ -257,24 +271,32 @@ class ModelProcessingEngine:
         model: str,
         temperature: float,
         max_tokens: int | None,
+        contract_retries: int,
         progress: Callable[..., None],
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, int]]:
         batch = task.batch_policy
         if not batch.enabled:
             progress("provider_call_started", chunkIndex=1, chunkCount=1, processed=0)
-            call = self._provider_call(
+            call, calls = self._provider_call_with_contract_repair(
                 execution_id=execution_id,
-                sequence=1,
+                sequence_start=1,
                 task=task,
                 input_payload=input_payload,
                 provider=provider,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                contract_retries=contract_retries,
+                progress=progress,
+                chunk_index=1,
+                chunk_count=1,
             )
-            validate_instance(call.content, task.output_schema, label="output")
             progress("provider_call_completed", chunkIndex=1, chunkCount=1, processed=1)
-            return call.content, call.usage, _provider_report([call], processed=1)
+            return call.content, _merge_usage(calls), _provider_report(
+                calls,
+                processed=1,
+                contract_repairs=len(calls) - 1,
+            )
 
         items = input_payload.get(batch.input_field)
         if not isinstance(items, list):
@@ -288,22 +310,31 @@ class ModelProcessingEngine:
             progress("provider_call_completed", chunkIndex=0, chunkCount=0, processed=0)
             return empty_result, _merge_usage([]), _provider_report([], processed=0)
         results: dict[int, ProviderCallResult] = {}
+        call_records: dict[int, list[ProviderCallResult]] = {}
         completed = 0
         progress("provider_call_started", chunkIndex=0, chunkCount=len(chunks), processed=0)
 
-        def call_chunk(index: int, chunk: list[Any]) -> tuple[int, ProviderCallResult]:
+        def call_chunk(
+            index: int,
+            chunk: list[Any],
+        ) -> tuple[int, ProviderCallResult, list[ProviderCallResult]]:
             chunk_input = copy.deepcopy(input_payload)
             chunk_input[batch.input_field] = chunk
-            return index, self._provider_call(
+            call, calls = self._provider_call_with_contract_repair(
                 execution_id=execution_id,
-                sequence=index + 1,
+                sequence_start=index * (contract_retries + 1) + 1,
                 task=task,
                 input_payload=chunk_input,
                 provider=provider,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                contract_retries=contract_retries,
+                progress=progress,
+                chunk_index=index + 1,
+                chunk_count=len(chunks),
             )
+            return index, call, calls
 
         worker_count = min(
             len(chunks),
@@ -316,8 +347,9 @@ class ModelProcessingEngine:
                 for index, chunk in enumerate(chunks)
             }
             for future in as_completed(futures):
-                index, call = future.result()
+                index, call, calls = future.result()
                 results[index] = call
+                call_records[index] = calls
                 completed += len(chunks[index])
                 progress(
                     "provider_chunk_completed",
@@ -326,21 +358,85 @@ class ModelProcessingEngine:
                     processed=completed,
                 )
         ordered = [results[index] for index in range(len(chunks))]
+        ordered_calls = [
+            call
+            for index in range(len(chunks))
+            for call in call_records[index]
+        ]
         merged = _merge_batch_outputs(ordered, output_field=batch.output_field)
         validate_instance(merged, task.output_schema, label="output")
-        return merged, _merge_usage(ordered), _provider_report(ordered, processed=len(items))
+        return merged, _merge_usage(ordered_calls), _provider_report(
+            ordered_calls,
+            processed=len(items),
+            contract_repairs=len(ordered_calls) - len(ordered),
+        )
 
-    def _provider_call(
+    def _provider_call_with_contract_repair(
         self,
         *,
         execution_id: str,
-        sequence: int,
+        sequence_start: int,
         task: TaskDefinition,
         input_payload: dict[str, Any],
         provider: ModelProvider,
         model: str,
         temperature: float,
         max_tokens: int | None,
+        contract_retries: int,
+        progress: Callable[..., None],
+        chunk_index: int,
+        chunk_count: int,
+    ) -> tuple[ProviderCallResult, list[ProviderCallResult]]:
+        calls: list[ProviderCallResult] = []
+        repair_feedback: str | None = None
+        previous_output: dict[str, Any] | None = None
+        for repair_attempt in range(contract_retries + 1):
+            call = self._provider_call(
+                execution_id=execution_id,
+                sequence=sequence_start + repair_attempt,
+                purpose="task" if repair_attempt == 0 else "contract_repair",
+                task=task,
+                input_payload=input_payload,
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                repair_feedback=repair_feedback,
+                previous_output=previous_output,
+            )
+            calls.append(call)
+            try:
+                validate_instance(call.content, task.output_schema, label="output")
+            except ContractValidationError as exc:
+                if repair_attempt >= contract_retries:
+                    raise
+                repair_feedback = str(exc)
+                previous_output = call.content
+                progress(
+                    "provider_contract_repair",
+                    chunkIndex=chunk_index,
+                    chunkCount=chunk_count,
+                    repairAttempt=repair_attempt + 1,
+                    repairLimit=contract_retries,
+                )
+                continue
+            return call, calls
+        raise AssertionError("contract repair loop exited without a result")
+
+    def _provider_call(
+        self,
+        *,
+        execution_id: str,
+        sequence: int,
+        purpose: str,
+        task: TaskDefinition,
+        input_payload: dict[str, Any],
+        provider: ModelProvider,
+        model: str,
+        temperature: float,
+        max_tokens: int | None,
+        repair_feedback: str | None,
+        previous_output: dict[str, Any] | None,
     ) -> ProviderCallResult:
         model_payload = {
             "outputSchema": task.output_schema,
@@ -358,6 +454,8 @@ class ModelProcessingEngine:
                     output_schema=task.output_schema,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    repair_feedback=repair_feedback,
+                    previous_output=previous_output,
                 )
         except Exception as exc:
             usage = dict(exc.usage) if isinstance(exc, ProviderError) else {}
@@ -372,7 +470,7 @@ class ModelProcessingEngine:
                 {
                     "callId": call_id,
                     "executionId": execution_id,
-                    "purpose": "task",
+                    "purpose": purpose,
                     "sequence": sequence,
                     "providerId": provider.config.id,
                     "model": model,
@@ -388,7 +486,7 @@ class ModelProcessingEngine:
             {
                 "callId": call_id,
                 "executionId": execution_id,
-                "purpose": "task",
+                "purpose": purpose,
                 "sequence": sequence,
                 "providerId": provider.config.id,
                 "model": model,
@@ -514,6 +612,7 @@ class ModelProcessingEngine:
                 "providerElapsedMs": 0,
                 "providerCallCount": 0,
                 "transportRetries": 0,
+                "contractRepairs": 0,
             }
         )
         self._save_execution(task, envelope)
@@ -599,10 +698,16 @@ def _merge_usage(calls: list[ProviderCallResult]) -> dict[str, Any]:
     }
 
 
-def _provider_report(calls: list[ProviderCallResult], *, processed: int) -> dict[str, int]:
+def _provider_report(
+    calls: list[ProviderCallResult],
+    *,
+    processed: int,
+    contract_repairs: int = 0,
+) -> dict[str, int]:
     return {
         "providerCallCount": len(calls),
         "transportRetries": sum(max(0, call.attempts - 1) for call in calls),
+        "contractRepairs": max(0, contract_repairs),
         "providerElapsedMs": sum(call.elapsed_ms for call in calls),
         "processed": processed,
     }

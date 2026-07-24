@@ -66,6 +66,20 @@ class SettingsAndProviderTests(unittest.TestCase):
                 settings = load_settings(temp_dir)
                 self.assertEqual(settings.api_token, "secret")
 
+    def test_async_queue_limits_are_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                "MPE_ASYNC_WORKERS": "3",
+                "MPE_ASYNC_QUEUE_CAPACITY": "17",
+            },
+            clear=True,
+        ):
+            settings = load_settings(temp_dir)
+
+        self.assertEqual(settings.async_worker_count, 3)
+        self.assertEqual(settings.async_queue_capacity, 17)
+
     def test_openai_compatible_provider_parses_json_and_usage(self) -> None:
         config = ProviderConfig(
             id="test",
@@ -154,6 +168,86 @@ class SettingsAndProviderTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.usage["cacheReadInputTokens"], 6)
+
+    def test_native_json_schema_capability_uses_provider_schema_mode(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+                capabilities=("structured_json", "native_json_schema"),
+            )
+        )
+        response = _Response(
+            {"choices": [{"message": {"content": '{"answer":true}'}}]}
+        )
+        output_schema = {
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "boolean"}},
+            "additionalProperties": False,
+        }
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload={"input": {"text": "hello"}},
+                    output_schema=output_schema,
+                    temperature=0,
+                    max_tokens=None,
+                )
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+        self.assertEqual(
+            payload["response_format"]["json_schema"]["schema"],
+            output_schema,
+        )
+
+    def test_contract_repair_appends_previous_output_and_feedback(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {"choices": [{"message": {"content": '{"summary":"fixed"}'}}]}
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload={"input": {"text": "hello"}},
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=None,
+                    repair_feedback="missing required property summary",
+                    previous_output={"wrong": True},
+                )
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual([message["role"] for message in payload["messages"]], [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ])
+        self.assertIn("missing required property", payload["messages"][-1]["content"])
 
     def test_empty_provider_content_preserves_usage_for_audit(self) -> None:
         provider = OpenAICompatibleProvider(

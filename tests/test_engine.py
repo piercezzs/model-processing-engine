@@ -99,7 +99,9 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(provider.call_count, 2)
 
     def test_failed_force_refresh_preserves_previous_cache(self) -> None:
-        responses = iter(({"summary": "original"}, {"invalid": True}))
+        responses = iter(
+            ({"summary": "original"}, {"invalid": True}, {"invalid": True})
+        )
 
         def responder(_payload, _schema):
             return next(responses)
@@ -113,7 +115,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(refreshed.status, "failed")
             self.assertTrue(cached.cache["hit"])
             self.assertEqual(cached.result, {"summary": "original"})
-            self.assertEqual(provider.call_count, 2)
+            self.assertEqual(provider.call_count, 3)
 
     def test_prompt_and_model_are_mandatory_cache_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -191,7 +193,7 @@ class EngineTests(unittest.TestCase):
             invalid_output = engine.execute(execution_request(task, {"text": "hello"}))
             self.assertEqual(invalid_input.status, "failed")
             self.assertEqual(invalid_output.status, "failed")
-            self.assertEqual(provider.call_count, 1)
+            self.assertEqual(provider.call_count, 2)
             self.assertEqual(engine.store.cache_count(), 0)
 
     def test_provider_usage_is_audited_before_output_schema_validation(self) -> None:
@@ -214,11 +216,48 @@ class EngineTests(unittest.TestCase):
             history = engine.store.execution_history()
 
             self.assertEqual(result.status, "failed")
-            self.assertEqual(history["summary"]["providerCallCount"], 1)
-            self.assertEqual(history["summary"]["transportRetries"], 1)
-            self.assertEqual(history["summary"]["usage"]["totalTokens"], 13)
+            self.assertEqual(history["summary"]["providerCallCount"], 2)
+            self.assertEqual(history["summary"]["transportRetries"], 2)
+            self.assertEqual(history["summary"]["contractRepairs"], 1)
+            self.assertEqual(history["summary"]["usage"]["totalTokens"], 26)
             self.assertEqual(history["items"][0]["error"], "ContractValidationError")
             self.assertNotIn("result", history["items"][0])
+
+    def test_output_contract_failure_is_repaired_once(self) -> None:
+        responses = iter(({"wrong": True}, {"summary": "repaired"}))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(
+                Path(temp_dir),
+                responder=lambda _payload, _schema: next(responses),
+            )
+
+            result = engine.execute(execution_request(task_definition()))
+            history = engine.store.execution_history()
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.result, {"summary": "repaired"})
+            self.assertEqual(result.timing["providerCallCount"], 2)
+            self.assertEqual(result.timing["contractRepairs"], 1)
+            self.assertEqual(provider.call_count, 2)
+            self.assertEqual(history["summary"]["contractRepairs"], 1)
+
+    def test_runtime_can_disable_contract_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(
+                Path(temp_dir),
+                responder=lambda _payload, _schema: {"wrong": True},
+            )
+
+            result = engine.execute(
+                execution_request(
+                    task_definition(),
+                    runtime={"contractRetries": 0},
+                )
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(provider.call_count, 1)
 
     def test_sensitive_result_is_returned_but_not_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

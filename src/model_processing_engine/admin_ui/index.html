@@ -11,7 +11,7 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">MODEL PROCESSING ENGINE</p>
-        <h1>模型管理</h1>
+        <h1>MPE 管理</h1>
       </div>
       <div class="service-state" aria-live="polite">
         <span class="status-dot" id="service-dot"></span>
@@ -19,7 +19,25 @@
       </div>
     </header>
 
-    <main class="workspace">
+    <nav class="primary-nav" aria-label="管理页面">
+      <button class="nav-item active" type="button" data-view="providers">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 6.5h16M7 12h10M9 17.5h6"></path>
+          <circle cx="4" cy="6.5" r="1.2"></circle>
+          <circle cx="17" cy="12" r="1.2"></circle>
+          <circle cx="9" cy="17.5" r="1.2"></circle>
+        </svg>
+        模型平台
+      </button>
+      <button class="nav-item" type="button" data-view="executions">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 19V9M10 19V5M16 19v-7M22 19H2"></path>
+        </svg>
+        调用记录
+      </button>
+    </nav>
+
+    <main class="workspace view-panel" id="provider-view">
       <aside class="provider-panel" aria-label="模型平台">
         <div class="panel-heading">
           <div>
@@ -114,6 +132,13 @@
                 <span>传输重试次数</span>
                 <input id="transport-retries" name="transportRetries" type="number" min="0" max="5" value="2">
               </label>
+              <label class="schema-capability">
+                <input id="native-json-schema" name="nativeJsonSchema" type="checkbox">
+                <span>
+                  <strong>Provider 原生 JSON Schema</strong>
+                  <small>仅在平台和所选模型明确支持严格 JSON Schema 时启用。</small>
+                </span>
+              </label>
             </div>
             <p class="advanced-help">
               普通服务商无需修改。完整请求地址由 Base URL 与对应路径拼接。
@@ -136,46 +161,142 @@
       </section>
     </main>
 
-    <section class="history-panel" aria-labelledby="history-title">
+    <section
+      class="history-panel view-panel"
+      id="execution-view"
+      aria-labelledby="history-title"
+      hidden
+    >
       <div class="history-heading">
         <div>
           <p class="section-label">EXECUTION HISTORY</p>
           <h2 id="history-title">模型调用记录</h2>
+          <p>按时间、模型和调用项目查看执行、Token、缓存与异常情况。</p>
         </div>
         <button class="compact-button" id="refresh-history" type="button">刷新记录</button>
       </div>
 
+      <div class="history-filters">
+        <div class="history-filter">
+          <span>统计周期</span>
+          <div class="period-toggle" role="group" aria-label="统计周期">
+            <button class="active" type="button" data-period="day">日</button>
+            <button type="button" data-period="month">月</button>
+            <button type="button" data-period="year">年</button>
+          </div>
+        </div>
+        <label class="history-filter">
+          <span id="history-anchor-label">日期</span>
+          <input id="history-anchor" type="date">
+        </label>
+        <label class="history-filter">
+          <span>调用类型</span>
+          <select id="history-kind">
+            <option value="task">正式任务</option>
+            <option value="provider_test">连接测试</option>
+            <option value="all">全部类型</option>
+          </select>
+        </label>
+        <label class="history-filter">
+          <span>Provider</span>
+          <select id="history-provider">
+            <option value="">全部 Provider</option>
+          </select>
+        </label>
+        <label class="history-filter">
+          <span>模型</span>
+          <select id="history-model">
+            <option value="">全部模型</option>
+          </select>
+        </label>
+        <p class="history-timezone" id="history-timezone">统计时区：正在读取…</p>
+      </div>
+
       <div class="history-metrics" aria-label="模型调用汇总">
         <div class="history-metric">
-          <span>执行记录</span>
+          <span>执行任务</span>
           <strong id="history-total">0</strong>
-        </div>
-        <div class="history-metric">
-          <span>已统计 Token</span>
-          <strong id="history-tokens">0</strong>
-          <small id="history-usage-coverage">0/0 条提供 usage</small>
-        </div>
-        <div class="history-metric">
-          <span>MPE 结果缓存</span>
-          <strong id="history-cache-hits">0</strong>
-          <small>跳过 Provider 的执行数</small>
-        </div>
-        <div class="history-metric">
-          <span>Provider Prompt Cache</span>
-          <strong id="history-provider-cache-tokens">0</strong>
-          <small id="history-provider-cache-coverage">0 条命中 · 0.0% 输入</small>
+          <small id="history-status-summary">0 成功 · 0 失败</small>
         </div>
         <div class="history-metric">
           <span>Provider 调用</span>
           <strong id="history-provider-calls">0</strong>
-          <small id="history-transport-retries">0 次传输重试</small>
+          <small id="history-transport-retries">0 次合同修复 · 0 次重试</small>
+        </div>
+        <div class="history-metric">
+          <span>总 Token</span>
+          <strong id="history-tokens">0</strong>
+          <small id="history-usage-coverage">输入 0 · 输出 0</small>
+        </div>
+        <div class="history-metric">
+          <span>Prompt Cache</span>
+          <strong id="history-provider-cache-tokens">0</strong>
+          <small id="history-provider-cache-coverage">0 条命中 · 0.0% 输入</small>
+        </div>
+        <div class="history-metric">
+          <span>MPE 结果缓存</span>
+          <strong id="history-cache-hits">0</strong>
+          <small id="history-cache-coverage">0 次跳过 Provider</small>
         </div>
       </div>
 
-      <p class="history-state" id="history-state" role="status" aria-live="polite">
-        正在读取调用记录…
-      </p>
-      <div class="history-list" id="history-list"></div>
+      <div class="history-insights">
+        <section class="history-card trend-card" aria-labelledby="history-trend-title">
+          <div class="history-card-heading">
+            <div>
+              <h3 id="history-trend-title">当天调用趋势</h3>
+              <p id="history-trend-description">按小时聚合执行任务与 Provider 调用</p>
+            </div>
+            <div class="trend-legend" aria-label="趋势图图例">
+              <span><i class="execution"></i>执行任务</span>
+              <span><i class="provider"></i>Provider 调用</span>
+            </div>
+          </div>
+          <div class="trend-chart" id="history-trend"></div>
+        </section>
+
+        <section class="history-card model-card" aria-labelledby="history-model-title">
+          <div class="history-card-heading">
+            <div>
+              <h3 id="history-model-title">按模型统计</h3>
+              <p>Provider 与模型组合识别</p>
+            </div>
+          </div>
+          <div class="model-table-wrap">
+            <table class="model-table">
+              <thead>
+                <tr>
+                  <th>Provider / 模型</th>
+                  <th>执行</th>
+                  <th>调用</th>
+                  <th>成功率</th>
+                  <th>Token</th>
+                </tr>
+              </thead>
+              <tbody id="history-model-table"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <section class="history-card records-card" aria-labelledby="history-records-title">
+        <div class="history-list-heading">
+          <h3 id="history-records-title">调用明细</h3>
+          <p class="history-state" id="history-state" role="status" aria-live="polite">
+            正在读取调用记录…
+          </p>
+        </div>
+        <div class="history-list" id="history-list"></div>
+        <div class="history-pagination">
+          <button class="compact-button" id="history-previous" type="button" disabled>
+            上一页
+          </button>
+          <span id="history-page-state">第 1 页</span>
+          <button class="compact-button" id="history-next" type="button" disabled>
+            下一页
+          </button>
+        </div>
+      </section>
     </section>
   </div>
 

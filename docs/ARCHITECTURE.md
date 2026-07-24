@@ -57,10 +57,18 @@ Sensitive tasks are synchronous only. Their result is returned in memory to the
 active caller and omitted from both cache entries and persisted execution
 records.
 
-Each data directory has one service-process owner. Service startup recovers
-queued or running records left by the prior runtime. SDK and one-shot CLI engine
-construction does not perform recovery, so it cannot rewrite an active service's
-execution status.
+Each data directory has one service-process owner. The HTTP service stores every
+asynchronous request and its queued execution envelope in one SQLite transaction.
+A bounded fixed worker pool claims queued rows; startup moves interrupted running
+rows back to queued before workers begin. Records without a durable queue payload
+remain unrecoverable and are marked failed rather than reconstructed. SDK and
+one-shot CLI engine construction does not perform recovery, so it cannot rewrite
+an active service's execution status.
+
+Recovery provides at-least-once execution for work interrupted before a terminal
+snapshot is committed. Queue rows whose execution snapshot is already terminal
+are removed without re-execution. Result caching and caller idempotency remain
+the safeguards for the narrower crash window before terminal persistence.
 
 Execution history is the technical audit source for all normal task executions
 and Provider connection tests. The paginated history contract excludes result
@@ -70,9 +78,20 @@ IDs and batch-level aggregates, but do not own a competing complete ledger.
 `execution_records` remains the operation-level terminal snapshot, while
 `provider_call_records` stores one redacted row per real upstream request. The
 second layer preserves usage for batch chunks, probe retries, transport errors,
-and calls whose returned content later fails output-schema validation. Neither
-layer stores prompts, caller input, Provider response bodies, or credentials in
-the history query surface.
+contract-repair calls, and calls whose returned content later fails output-schema
+validation. Neither layer stores prompts, caller input, Provider response bodies,
+or credentials in the history query surface. The queue table temporarily stores
+the complete validated asynchronous request for recovery, is not exposed by the
+history API, rejects sensitive tasks through the request contract, and deletes
+its row after terminal completion.
+
+Execution records also normalize task kind and Provider/model identity into
+indexed columns. Existing databases backfill those columns from their redacted
+execution envelope during schema initialization. Time-window statistics query
+the immutable UTC timestamps and group them in the caller-supplied IANA
+timezone. Day, month, and year summaries are calculated from the event ledger;
+there is no separate rollup table whose state could drift from the underlying
+records.
 
 ## Security Boundary
 
@@ -103,6 +122,13 @@ The HTTP path version comes from one runtime constant. Provider capability and
 configured-model declarations are exposed without credential environment names
 or secret values.
 
+Provider-native JSON Schema is capability-gated. An OpenAI-compatible Provider
+uses strict `json_schema` response format only when its configuration explicitly
+declares `native_json_schema`; otherwise it uses JSON-object mode. Local Draft
+2020-12 validation always remains authoritative. A validation failure may trigger
+the task's bounded contract-repair count. Each repair is a separate audited
+Provider call and is not counted as a transport retry.
+
 ## Provider Concurrency Ownership
 
 Concurrency limits belong to Provider configuration rather than caller Task
@@ -117,6 +143,11 @@ larger workloads can fill the configured limit, and excess calls wait without
 forcing the caller to coordinate with other projects using the same MPE
 process. Concurrency settings do not participate in cache identity because they
 change scheduling, not model semantics.
+
+The asynchronous worker count bounds how many execution envelopes may be active
+at once; Provider semaphores remain the final upstream concurrency ceiling.
+Queue capacity bounds queued plus active asynchronous work and applies
+backpressure with HTTP 429 before another request is persisted.
 
 ## Local Administration Boundary
 
@@ -139,6 +170,13 @@ entry as the compatibility fallback. Activation atomically writes the project
 `.env` and ignored `config/providers.local.json`, then starts a detached control
 helper that uses the existing verified process manager to restart the service.
 The UI polls health and obtains a new CSRF token after recovery.
+
+The admin surface keeps Provider configuration and execution observability as
+separate top-level views. Its history view defaults to formal tasks so Provider
+connection tests do not silently affect business-call statistics. A dedicated
+statistics route owns period summaries, trend buckets, filter facets, and
+Provider/model breakdowns, while the paginated execution route remains the
+redacted record-detail source.
 
 Secrets remain plaintext by the explicitly selected project `.env` policy, but
 the file is Git-ignored, mode `0600` on Unix, never returned over the API, and

@@ -1,14 +1,34 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from model_processing_engine.cache import SQLiteRuntimeStore
+from model_processing_engine.exceptions import AsyncQueueFullError
 
 
 class CacheStoreTests(unittest.TestCase):
+    @staticmethod
+    def _queued_envelope(execution_id: str) -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "executionId": execution_id,
+            "status": "queued",
+            "task": {"namespace": "one", "id": "task", "version": "1"},
+            "provider": {},
+            "cache": {},
+            "usage": {},
+            "timing": {},
+            "progress": {"event": "queued"},
+            "result": None,
+            "warnings": [],
+            "error": None,
+        }
+
     def test_cache_persists_across_store_instances(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "runtime.sqlite"
@@ -82,6 +102,37 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(record["status"], "failed")
             self.assertIn("interrupted", record["error"])
 
+    def test_async_queue_is_bounded_and_recovers_running_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            request = {"task": {"id": "task"}, "input": {"text": "hello"}}
+            store.enqueue_async_execution(
+                envelope=self._queued_envelope("exec-1"),
+                request=request,
+                capacity=1,
+            )
+            with self.assertRaises(AsyncQueueFullError):
+                store.enqueue_async_execution(
+                    envelope=self._queued_envelope("exec-2"),
+                    request=request,
+                    capacity=1,
+                )
+            claimed = store.claim_next_async_execution()
+            self.assertEqual(claimed, ("exec-1", request))
+            self.assertEqual(store.async_queue_stats()["running"], 1)
+
+            restarted = SQLiteRuntimeStore(path)
+            recovery = restarted.recover_async_executions()
+            self.assertEqual(recovery, {"recovered": 1, "orphaned": 0})
+            self.assertEqual(restarted.get_execution("exec-1")["status"], "queued")
+            self.assertEqual(
+                restarted.claim_next_async_execution(),
+                ("exec-1", request),
+            )
+            restarted.finish_async_execution("exec-1")
+            self.assertEqual(restarted.async_queue_stats()["total"], 0)
+
     def test_execution_history_is_redacted_paginated_and_aggregated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
@@ -132,6 +183,163 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(
                 history["summary"]["usage"]["cacheReadInputTokens"],
                 2,
+            )
+
+    def test_execution_history_filters_and_period_statistics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
+            first_time = 1784772000.0
+            with patch("model_processing_engine.cache.time.time", return_value=first_time):
+                store.save_execution(
+                    {
+                        "schemaVersion": 1,
+                        "executionId": "exec-deepseek",
+                        "status": "succeeded",
+                        "task": {
+                            "namespace": "project",
+                            "id": "interpret",
+                            "version": "1",
+                            "kind": "task",
+                        },
+                        "provider": {"id": "deepseek", "model": "flash"},
+                        "cache": {"hit": False},
+                        "usage": {},
+                        "timing": {
+                            "createdAt": "2026-07-23T02:00:00+00:00",
+                            "completedAt": "2026-07-23T02:00:02+00:00",
+                            "elapsedMs": 2000,
+                        },
+                    }
+                )
+                store.save_provider_call(
+                    {
+                        "callId": "call-deepseek",
+                        "executionId": "exec-deepseek",
+                        "purpose": "task",
+                        "sequence": 1,
+                        "providerId": "deepseek",
+                        "model": "flash",
+                        "status": "succeeded",
+                        "usage": {
+                            "available": True,
+                            "inputTokens": 8,
+                            "outputTokens": 2,
+                            "totalTokens": 10,
+                            "cacheReadInputTokens": 4,
+                        },
+                        "attempts": 1,
+                        "elapsedMs": 1900,
+                    }
+                )
+            second_time = first_time + 86400
+            with patch("model_processing_engine.cache.time.time", return_value=second_time):
+                store.save_execution(
+                    {
+                        "schemaVersion": 1,
+                        "executionId": "exec-probe",
+                        "status": "failed",
+                        "task": {
+                            "namespace": "_mpe",
+                            "id": "provider_connection_test",
+                            "version": "1",
+                            "kind": "provider_test",
+                        },
+                        "provider": {"id": "mock", "model": "mock-v1"},
+                        "cache": {"hit": False},
+                        "usage": {},
+                        "timing": {"createdAt": "2026-07-24T02:00:00+00:00"},
+                    }
+                )
+
+            history = store.execution_history(
+                kind="task",
+                provider_id="deepseek",
+                model="flash",
+                created_from=first_time - 1,
+                created_to=first_time + 1,
+            )
+            statistics = store.execution_statistics(
+                period="day",
+                anchor="2026-07-23",
+                timezone_name="UTC",
+                kind="task",
+            )
+
+            self.assertEqual(history["pagination"]["total"], 1)
+            self.assertEqual(history["items"][0]["executionId"], "exec-deepseek")
+            self.assertEqual(statistics["summary"]["total"], 1)
+            self.assertEqual(statistics["summary"]["providerCallCount"], 1)
+            self.assertEqual(statistics["summary"]["usage"]["totalTokens"], 10)
+            self.assertEqual(statistics["series"][2]["executions"], 1)
+            self.assertEqual(statistics["models"][0]["providerId"], "deepseek")
+            self.assertEqual(statistics["models"][0]["model"], "flash")
+            self.assertEqual(
+                statistics["facets"]["providers"],
+                [{"id": "deepseek", "models": ["flash"]}],
+            )
+
+    def test_existing_execution_records_are_backfilled_for_statistics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runtime.sqlite"
+            envelope = {
+                "executionId": "legacy",
+                "status": "succeeded",
+                "task": {
+                    "namespace": "legacy-project",
+                    "id": "legacy-task",
+                    "version": "1",
+                    "kind": "provider_test",
+                },
+                "provider": {"id": "legacy-provider", "model": "legacy-model"},
+                "timing": {"createdAt": "2026-07-23T01:00:00+00:00"},
+            }
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE execution_records (
+                        execution_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        namespace TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        task_version TEXT NOT NULL,
+                        envelope_json TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO execution_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy",
+                        "succeeded",
+                        "legacy-project",
+                        "legacy-task",
+                        "1",
+                        json.dumps(envelope),
+                        1784768400.0,
+                        1784768400.0,
+                    ),
+                )
+
+            store = SQLiteRuntimeStore(path)
+            history = store.execution_history(kind="provider_test")
+
+            self.assertEqual(history["pagination"]["total"], 1)
+            self.assertEqual(history["items"][0]["provider"]["id"], "legacy-provider")
+            with sqlite3.connect(path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT kind, provider_id, model
+                    FROM execution_records
+                    WHERE execution_id = 'legacy'
+                    """
+                ).fetchone()
+            self.assertEqual(
+                row,
+                ("provider_test", "legacy-provider", "legacy-model"),
             )
 
 

@@ -41,6 +41,7 @@ class RuntimeDefaults(StrictModel):
     model: str | None = Field(default=None, max_length=256)
     temperature: float = Field(default=0.1, ge=0, le=2)
     max_tokens: int | None = Field(default=None, alias="maxTokens", ge=1, le=1_000_000)
+    contract_retries: int = Field(default=1, alias="contractRetries", ge=0, le=2)
 
 
 class BatchPolicy(StrictModel):
@@ -118,6 +119,7 @@ class RuntimeOptions(StrictModel):
     model: str | None = Field(default=None, max_length=256)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, alias="maxTokens", ge=1, le=1_000_000)
+    contract_retries: int | None = Field(default=None, alias="contractRetries", ge=0, le=2)
     force_refresh: bool = Field(default=False, alias="forceRefresh")
 
 

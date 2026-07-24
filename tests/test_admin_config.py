@@ -89,6 +89,7 @@ class AdminConfigManagerTests(unittest.TestCase):
                     "presetId": "custom",
                     "modelsPath": "/models",
                     "availableModels": ["model-one", "model-two"],
+                    "nativeJsonSchema": True,
                     "apiKey": "local-secret",
                 }
             )
@@ -116,6 +117,14 @@ class AdminConfigManagerTests(unittest.TestCase):
             self.assertEqual(selected["availableModels"], ["model-one", "model-two"])
             self.assertEqual(selected["modelsPath"], "/models")
             self.assertEqual(selected["maxConcurrency"], 8)
+            self.assertTrue(selected["nativeJsonSchema"])
+            local = json.loads(
+                (project / "config" / "providers.local.json").read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "native_json_schema",
+                local["providers"]["private-model"]["capabilities"],
+            )
 
     def test_model_discovery_uses_key_without_persisting_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):

@@ -34,8 +34,10 @@ class MockProvider:
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        repair_feedback: str | None = None,
+        previous_output: dict[str, Any] | None = None,
     ) -> ProviderCallResult:
-        del model, system_prompt, temperature, max_tokens
+        del model, system_prompt, temperature, max_tokens, repair_feedback, previous_output
         started = time.perf_counter()
         with self._lock:
             self.call_count += 1

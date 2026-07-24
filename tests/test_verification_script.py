@@ -62,6 +62,7 @@ class VerificationScriptContractTests(unittest.TestCase):
         self.assertEqual(steps[0].command[0], sys.executable)
         self.assertIn("historyProviderCacheTokens", module.ADMIN_SCRIPT_MARKERS)
         self.assertIn("historyTransportRetries", module.ADMIN_SCRIPT_MARKERS)
+        self.assertIn("nativeJsonSchema", module.ADMIN_SCRIPT_MARKERS)
 
 
 if __name__ == "__main__":

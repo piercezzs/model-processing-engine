@@ -9,9 +9,17 @@ const state = {
   selectedProviderId: "",
   availableModels: [],
   verificationToken: "",
+  historyPeriod: "day",
+  historyOffset: 0,
+  historyPageSize: 20,
+  historyRequestId: 0,
+  historyTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
 };
 
 const elements = {
+  navItems: [...document.querySelectorAll("[data-view]")],
+  providerView: document.querySelector("#provider-view"),
+  executionView: document.querySelector("#execution-view"),
   serviceDot: document.querySelector("#service-dot"),
   serviceLabel: document.querySelector("#service-label"),
   providerList: document.querySelector("#provider-list"),
@@ -36,6 +44,7 @@ const elements = {
   timeoutSeconds: document.querySelector("#timeout-seconds"),
   maxConcurrency: document.querySelector("#max-concurrency"),
   transportRetries: document.querySelector("#transport-retries"),
+  nativeJsonSchema: document.querySelector("#native-json-schema"),
   remoteFields: document.querySelector("#remote-fields"),
   resultBox: document.querySelector("#result-box"),
   testProvider: document.querySelector("#test-provider"),
@@ -51,11 +60,31 @@ const elements = {
   historyProviderCacheCoverage: document.querySelector("#history-provider-cache-coverage"),
   historyProviderCalls: document.querySelector("#history-provider-calls"),
   historyTransportRetries: document.querySelector("#history-transport-retries"),
+  historyStatusSummary: document.querySelector("#history-status-summary"),
+  historyCacheCoverage: document.querySelector("#history-cache-coverage"),
+  historyPeriodButtons: [...document.querySelectorAll("[data-period]")],
+  historyAnchor: document.querySelector("#history-anchor"),
+  historyAnchorLabel: document.querySelector("#history-anchor-label"),
+  historyKind: document.querySelector("#history-kind"),
+  historyProvider: document.querySelector("#history-provider"),
+  historyModel: document.querySelector("#history-model"),
+  historyTimezone: document.querySelector("#history-timezone"),
+  historyTrend: document.querySelector("#history-trend"),
+  historyTrendTitle: document.querySelector("#history-trend-title"),
+  historyTrendDescription: document.querySelector("#history-trend-description"),
+  historyModelTable: document.querySelector("#history-model-table"),
   historyState: document.querySelector("#history-state"),
   historyList: document.querySelector("#history-list"),
+  historyPrevious: document.querySelector("#history-previous"),
+  historyNext: document.querySelector("#history-next"),
+  historyPageState: document.querySelector("#history-page-state"),
 };
 
 const numberFormatter = new Intl.NumberFormat("zh-CN");
+const compactNumberFormatter = new Intl.NumberFormat("zh-CN", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
 
 function setServiceState(online, label) {
   elements.serviceDot.classList.toggle("online", online);
@@ -101,6 +130,93 @@ function formatHistoryTime(value) {
     : parsed.toLocaleString("zh-CN", {hour12: false});
 }
 
+function formatDuration(value) {
+  const milliseconds = Math.max(0, Number(value) || 0);
+  if (!milliseconds) {
+    return "耗时未知";
+  }
+  if (milliseconds < 1000) {
+    return `${Math.round(milliseconds)} ms`;
+  }
+  if (milliseconds < 60000) {
+    return `${(milliseconds / 1000).toFixed(1)} 秒`;
+  }
+  return `${(milliseconds / 60000).toFixed(1)} 分钟`;
+}
+
+function localAnchor(period, date = new Date()) {
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  if (period === "year") {
+    return year;
+  }
+  if (period === "month") {
+    return `${year}-${month}`;
+  }
+  return `${year}-${month}-${day}`;
+}
+
+function updateHistoryAnchorControl() {
+  const current = elements.historyAnchor.value;
+  const currentYear = /^\d{4}/.test(current) ? current.slice(0, 4) : "";
+  const currentMonth = /^\d{4}-\d{2}/.test(current) ? current.slice(0, 7) : "";
+  const currentDay = /^\d{4}-\d{2}-\d{2}$/.test(current) ? current : "";
+  if (state.historyPeriod === "year") {
+    elements.historyAnchor.type = "number";
+    elements.historyAnchor.min = "2000";
+    elements.historyAnchor.max = "9998";
+    elements.historyAnchor.step = "1";
+    elements.historyAnchor.value = currentYear || localAnchor("year");
+    elements.historyAnchorLabel.textContent = "年份";
+  } else if (state.historyPeriod === "month") {
+    elements.historyAnchor.type = "month";
+    elements.historyAnchor.removeAttribute("min");
+    elements.historyAnchor.removeAttribute("max");
+    elements.historyAnchor.removeAttribute("step");
+    elements.historyAnchor.value =
+      currentMonth ||
+      (currentYear ? `${currentYear}-${localAnchor("month").slice(5)}` : localAnchor("month"));
+    elements.historyAnchorLabel.textContent = "月份";
+  } else {
+    elements.historyAnchor.type = "date";
+    elements.historyAnchor.removeAttribute("min");
+    elements.historyAnchor.removeAttribute("max");
+    elements.historyAnchor.removeAttribute("step");
+    elements.historyAnchor.value =
+      currentDay ||
+      (currentYear ? `${currentYear}-${localAnchor("day").slice(5)}` : localAnchor("day"));
+    elements.historyAnchorLabel.textContent = "日期";
+  }
+  for (const button of elements.historyPeriodButtons) {
+    button.classList.toggle("active", button.dataset.period === state.historyPeriod);
+  }
+}
+
+function currentView() {
+  return window.location.hash === "#executions" ? "executions" : "providers";
+}
+
+function setView(view, {updateHash = true} = {}) {
+  const nextView = view === "executions" ? "executions" : "providers";
+  elements.providerView.hidden = nextView !== "providers";
+  elements.executionView.hidden = nextView !== "executions";
+  for (const item of elements.navItems) {
+    const active = item.dataset.view === nextView;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-current", active ? "page" : "false");
+  }
+  if (updateHash) {
+    const nextHash = nextView === "executions" ? "#executions" : "#providers";
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, "", nextHash);
+    }
+  }
+  if (nextView === "executions") {
+    loadHistory();
+  }
+}
+
 function historyStatusLabel(status) {
   return {
     queued: "等待中",
@@ -118,28 +234,207 @@ function historyTaskLabel(item) {
   return [task.namespace, task.id].filter(Boolean).join(" / ") || "未命名任务";
 }
 
-function renderHistory(payload) {
+function replaceOptions(select, options, selectedValue) {
+  select.replaceChildren();
+  const nextOptions = [...options];
+  if (
+    selectedValue &&
+    !nextOptions.some((option) => option.value === selectedValue)
+  ) {
+    nextOptions.push({
+      value: selectedValue,
+      label: `${selectedValue}（当前筛选）`,
+    });
+  }
+  for (const optionData of nextOptions) {
+    const option = document.createElement("option");
+    option.value = optionData.value;
+    option.textContent = optionData.label;
+    select.append(option);
+  }
+  select.value = selectedValue || "";
+}
+
+function renderHistoryFacets(facets) {
+  const providers = Array.isArray(facets?.providers) ? facets.providers : [];
+  const selectedProvider = elements.historyProvider.value;
+  const selectedModel = elements.historyModel.value;
+  replaceOptions(
+    elements.historyProvider,
+    [
+      {value: "", label: "全部 Provider"},
+      ...providers.map((provider) => ({
+        value: provider.id,
+        label: provider.id,
+      })),
+    ],
+    selectedProvider,
+  );
+  const activeProvider = elements.historyProvider.value;
+  const models = activeProvider
+    ? providers.find((provider) => provider.id === activeProvider)?.models || []
+    : [...new Set(providers.flatMap((provider) => provider.models || []))]
+      .sort((left, right) => left.localeCompare(right));
+  replaceOptions(
+    elements.historyModel,
+    [
+      {value: "", label: "全部模型"},
+      ...models.map((model) => ({value: model, label: model})),
+    ],
+    selectedModel,
+  );
+}
+
+function renderTrend(series, period) {
+  elements.historyTrend.replaceChildren();
+  const items = Array.isArray(series) ? series : [];
+  const titles = {
+    day: ["当天调用趋势", "按小时聚合执行任务与 Provider 调用"],
+    month: ["本月调用趋势", "按日期聚合执行任务与 Provider 调用"],
+    year: ["全年调用趋势", "按月份聚合执行任务与 Provider 调用"],
+  };
+  const [title, description] = titles[period] || titles.day;
+  elements.historyTrendTitle.textContent = title;
+  elements.historyTrendDescription.textContent = description;
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "history-chart-empty";
+    empty.textContent = "当前周期暂无趋势数据";
+    elements.historyTrend.append(empty);
+    return;
+  }
+  const maximum = Math.max(
+    1,
+    ...items.flatMap((item) => [
+      Number(item.executions) || 0,
+      Number(item.providerCalls) || 0,
+    ]),
+  );
+  const labelEvery = period === "day" ? 3 : period === "month" ? 5 : 1;
+  items.forEach((item, index) => {
+    const bucket = document.createElement("div");
+    bucket.className = "trend-bucket";
+    bucket.title =
+      `${item.label}：${formatNumber(item.executions)} 次执行，` +
+      `${formatNumber(item.providerCalls)} 次 Provider 调用，` +
+      `${formatNumber(item.totalTokens)} Token`;
+    const bars = document.createElement("div");
+    bars.className = "trend-bars";
+    for (const [kind, value] of [
+      ["execution", item.executions],
+      ["provider", item.providerCalls],
+    ]) {
+      const bar = document.createElement("span");
+      bar.className = `trend-bar ${kind}`;
+      const numeric = Math.max(0, Number(value) || 0);
+      bar.style.height = numeric
+        ? `${Math.max(3, numeric / maximum * 100)}%`
+        : "2px";
+      bars.append(bar);
+    }
+    const label = document.createElement("span");
+    label.className = "trend-label";
+    const showLabel =
+      index === 0 ||
+      index === items.length - 1 ||
+      index % labelEvery === 0;
+    label.textContent = showLabel ? item.label : "";
+    bucket.append(bars, label);
+    elements.historyTrend.append(bucket);
+  });
+}
+
+function renderModelBreakdown(models) {
+  elements.historyModelTable.replaceChildren();
+  const items = Array.isArray(models) ? models : [];
+  if (!items.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.className = "model-table-empty";
+    cell.colSpan = 5;
+    cell.textContent = "当前筛选条件下暂无模型调用";
+    row.append(cell);
+    elements.historyModelTable.append(row);
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement("tr");
+    const identityCell = document.createElement("td");
+    const identity = document.createElement("span");
+    identity.className = "model-identity";
+    const provider = document.createElement("strong");
+    provider.textContent = item.providerId || "Provider 未知";
+    const model = document.createElement("span");
+    model.textContent = item.model || "模型未知";
+    identity.append(provider, model);
+    identityCell.append(identity);
+
+    const executions = document.createElement("td");
+    executions.textContent = formatNumber(item.executions);
+    const calls = document.createElement("td");
+    calls.textContent = formatNumber(item.providerCalls);
+    const successRate = document.createElement("td");
+    successRate.className = "model-success-rate";
+    successRate.textContent = `${Number(item.successRate || 0).toFixed(1)}%`;
+    const tokens = document.createElement("td");
+    tokens.textContent = compactNumberFormatter.format(
+      Math.max(0, Number(item.usage?.totalTokens) || 0),
+    );
+    row.append(identityCell, executions, calls, successRate, tokens);
+    elements.historyModelTable.append(row);
+  }
+}
+
+function renderHistoryStatistics(payload) {
   const summary = payload.summary || {};
   const usage = summary.usage || {};
   elements.historyTotal.textContent = formatNumber(summary.total);
   elements.historyTokens.textContent = formatNumber(usage.totalTokens);
-  elements.historyUsageCoverage.textContent = `${formatNumber(summary.usageAvailableExecutions)}/${formatNumber(summary.total)} 条提供 usage`;
+  elements.historyUsageCoverage.textContent =
+    `输入 ${formatNumber(usage.inputTokens)} · 输出 ${formatNumber(usage.outputTokens)}`;
   elements.historyCacheHits.textContent = formatNumber(summary.cacheHits);
+  elements.historyCacheCoverage.textContent =
+    `${formatNumber(summary.cacheHits)} 次跳过 Provider`;
   elements.historyProviderCacheTokens.textContent = formatNumber(usage.cacheReadInputTokens);
   elements.historyProviderCacheCoverage.textContent =
     `${formatNumber(summary.providerCacheHitExecutions)} 条命中 · ` +
     `${formatRatio(usage.cacheReadInputTokens, usage.inputTokens)} 输入`;
   elements.historyProviderCalls.textContent = formatNumber(summary.providerCallCount);
   elements.historyTransportRetries.textContent =
-    `${formatNumber(summary.transportRetries)} 次传输重试`;
+    `${formatNumber(summary.contractRepairs)} 次合同修复 · ` +
+    `${formatNumber(summary.transportRetries)} 次重试`;
+  elements.historyStatusSummary.textContent =
+    `${formatNumber(summary.succeeded)} 成功 · ${formatNumber(summary.failed)} 失败` +
+    (summary.averageElapsedMs
+      ? ` · 平均 ${formatDuration(summary.averageElapsedMs)}`
+      : "");
+  renderHistoryFacets(payload.facets || {});
+  renderTrend(payload.series, payload.period?.kind || state.historyPeriod);
+  renderModelBreakdown(payload.models);
+}
+
+function renderHistory(payload) {
   elements.historyList.replaceChildren();
 
   const items = Array.isArray(payload.items) ? payload.items : [];
+  const pagination = payload.pagination || {};
+  const total = Math.max(0, Number(pagination.total) || 0);
+  const page = Math.floor(state.historyOffset / state.historyPageSize) + 1;
+  const totalPages = Math.max(1, Math.ceil(total / state.historyPageSize));
+  elements.historyPageState.textContent = `第 ${page} / ${totalPages} 页`;
+  elements.historyPrevious.disabled = state.historyOffset <= 0;
+  elements.historyNext.disabled = !pagination.hasMore;
   if (!items.length) {
-    elements.historyState.textContent = "尚无正式任务或 Provider 连接测试记录。";
+    elements.historyState.textContent = "当前筛选条件下没有调用记录";
+    const empty = document.createElement("p");
+    empty.className = "history-list-empty";
+    empty.textContent = "可以切换日期、调用类型、Provider 或模型后重试。";
+    elements.historyList.append(empty);
     return;
   }
-  elements.historyState.textContent = `显示最近 ${formatNumber(items.length)} 条；记录不包含模型正文。`;
+  const kindLabel = elements.historyKind.selectedOptions[0]?.textContent || "调用";
+  elements.historyState.textContent =
+    `共 ${formatNumber(total)} 条${kindLabel} · 当前显示 ${formatNumber(items.length)} 条`;
   for (const item of items) {
     const record = document.createElement("article");
     record.className = "history-record";
@@ -169,20 +464,34 @@ function renderHistory(payload) {
     tokenCount.textContent = item.usage?.available
       ? `${formatNumber(item.usage.totalTokens)} Token`
       : "Token 未提供";
-    const cacheState = document.createElement("span");
-    const resultCacheState = item.cache?.hit
-      ? `缓存命中${item.cache.hitCount ? ` · 第 ${formatNumber(item.cache.hitCount)} 次` : ""}`
-      : `${formatNumber(item.timing?.providerCallCount)} 次 Provider 调用`;
+    const elapsed = document.createElement("span");
+    elapsed.textContent = formatDuration(item.timing?.elapsedMs);
+    usageCell.append(tokenCount, elapsed);
+
+    const auditCell = document.createElement("div");
+    auditCell.className = "history-audit";
+    const auditState = document.createElement("strong");
     const providerCacheTokens = Math.max(
       0,
       Number(item.usage?.cacheReadInputTokens) || 0,
     );
-    cacheState.textContent = providerCacheTokens
-      ? `${resultCacheState} · Prompt Cache ${formatNumber(providerCacheTokens)} Token`
-      : resultCacheState;
-    usageCell.append(tokenCount, cacheState);
+    if (item.cache?.hit) {
+      auditState.textContent = "MPE 结果缓存命中";
+    } else if (item.timing?.contractRepairs) {
+      auditState.textContent =
+        `合同修复 ${formatNumber(item.timing.contractRepairs)} 次`;
+    } else if (providerCacheTokens) {
+      auditState.textContent =
+        `Prompt Cache ${formatNumber(providerCacheTokens)}`;
+    } else {
+      auditState.textContent = "未命中缓存";
+    }
+    const providerCalls = document.createElement("span");
+    providerCalls.textContent =
+      `${formatNumber(item.timing?.providerCallCount)} 次 Provider 调用`;
+    auditCell.append(auditState, providerCalls);
 
-    record.append(time, identity, status, usageCell);
+    record.append(time, identity, status, usageCell, auditCell);
     if (item.error) {
       const error = document.createElement("p");
       error.className = "history-error";
@@ -193,17 +502,70 @@ function renderHistory(payload) {
   }
 }
 
-async function loadHistory({showLoading = false} = {}) {
+function historyStatsPath() {
+  const parameters = new URLSearchParams({
+    period: state.historyPeriod,
+    anchor: elements.historyAnchor.value,
+    timezone: state.historyTimezone,
+    kind: elements.historyKind.value,
+  });
+  if (elements.historyProvider.value) {
+    parameters.set("providerId", elements.historyProvider.value);
+  }
+  if (elements.historyModel.value) {
+    parameters.set("model", elements.historyModel.value);
+  }
+  return `${API_BASE}/execution-stats?${parameters.toString()}`;
+}
+
+function historyListPath(period) {
+  const parameters = new URLSearchParams({
+    limit: String(state.historyPageSize),
+    offset: String(state.historyOffset),
+    createdFrom: String(new Date(period.start).getTime() / 1000),
+    createdTo: String(new Date(period.end).getTime() / 1000),
+  });
+  if (elements.historyKind.value !== "all") {
+    parameters.set("kind", elements.historyKind.value);
+  }
+  if (elements.historyProvider.value) {
+    parameters.set("providerId", elements.historyProvider.value);
+  }
+  if (elements.historyModel.value) {
+    parameters.set("model", elements.historyModel.value);
+  }
+  return `${API_BASE}/executions?${parameters.toString()}`;
+}
+
+async function loadHistory({showLoading = false, resetPage = false} = {}) {
+  if (!elements.historyAnchor.value) {
+    return;
+  }
+  if (resetPage) {
+    state.historyOffset = 0;
+  }
+  const requestId = state.historyRequestId + 1;
+  state.historyRequestId = requestId;
   if (showLoading) {
     setButtonLoading(elements.refreshHistory, true, "正在刷新…");
   }
+  elements.historyState.textContent = "正在读取调用记录…";
   try {
-    const payload = await requestJson(`${API_BASE}/executions?limit=50&offset=0`);
+    const statistics = await requestJson(historyStatsPath());
+    if (requestId !== state.historyRequestId) {
+      return;
+    }
+    renderHistoryStatistics(statistics);
+    const payload = await requestJson(historyListPath(statistics.period));
+    if (requestId !== state.historyRequestId) {
+      return;
+    }
     renderHistory(payload);
   } catch (error) {
     elements.historyState.textContent = `调用记录读取失败：${error.message}`;
+    elements.historyList.replaceChildren();
   } finally {
-    if (showLoading) {
+    if (showLoading && requestId === state.historyRequestId) {
       setButtonLoading(elements.refreshHistory, false, "");
     }
   }
@@ -336,6 +698,7 @@ function selectProvider(providerId) {
   elements.timeoutSeconds.value = String(provider.timeoutSeconds);
   elements.maxConcurrency.value = String(provider.maxConcurrency);
   elements.transportRetries.value = String(provider.transportRetries);
+  elements.nativeJsonSchema.checked = Boolean(provider.nativeJsonSchema);
   elements.credentialState.textContent = provider.credentialConfigured
     ? "Key 已配置；留空将使用现有值"
     : "尚未配置 Key";
@@ -377,6 +740,7 @@ function newProvider() {
   elements.timeoutSeconds.value = "60";
   elements.maxConcurrency.value = "8";
   elements.transportRetries.value = "2";
+  elements.nativeJsonSchema.checked = false;
   setResult("选择服务商并填写 Key 后，可以先获取模型，再测试连接。", "neutral");
   renderProviderList();
   elements.providerPreset.focus();
@@ -401,6 +765,7 @@ function collectConnectionDraft() {
     timeoutSeconds: Number(elements.timeoutSeconds.value),
     maxConcurrency: Number(elements.maxConcurrency.value),
     transportRetries: Number(elements.transportRetries.value),
+    nativeJsonSchema: elements.nativeJsonSchema.checked,
   };
   if (elements.apiKey.value) {
     payload.apiKey = elements.apiKey.value;
@@ -493,7 +858,9 @@ async function testProvider() {
     setResult(error.message, "error");
   } finally {
     setButtonLoading(elements.testProvider, false, "");
-    loadHistory();
+    if (!elements.executionView.hidden) {
+      loadHistory();
+    }
   }
 }
 
@@ -529,7 +896,9 @@ async function waitForRestart() {
       const health = await response.json();
       if (response.ok && health.app === "model-processing-engine" && health.status === "ok") {
         await loadConfig();
-        await loadHistory();
+        if (!elements.executionView.hidden) {
+          await loadHistory();
+        }
         elements.restartOverlay.hidden = true;
         setResult("配置已经生效，MPE 服务已恢复。", "success");
         return;
@@ -591,10 +960,41 @@ elements.toggleKey.addEventListener("click", () => {
   elements.apiKey.type = showing ? "password" : "text";
   elements.toggleKey.textContent = showing ? "显示" : "隐藏";
 });
+for (const item of elements.navItems) {
+  item.addEventListener("click", () => setView(item.dataset.view));
+}
+for (const button of elements.historyPeriodButtons) {
+  button.addEventListener("click", () => {
+    state.historyPeriod = button.dataset.period;
+    updateHistoryAnchorControl();
+    loadHistory({resetPage: true});
+  });
+}
+elements.historyAnchor.addEventListener("change", () => loadHistory({resetPage: true}));
+elements.historyKind.addEventListener("change", () => loadHistory({resetPage: true}));
+elements.historyProvider.addEventListener("change", () => {
+  elements.historyModel.value = "";
+  loadHistory({resetPage: true});
+});
+elements.historyModel.addEventListener("change", () => loadHistory({resetPage: true}));
 elements.refreshHistory.addEventListener("click", () => loadHistory({showLoading: true}));
+elements.historyPrevious.addEventListener("click", () => {
+  state.historyOffset = Math.max(0, state.historyOffset - state.historyPageSize);
+  loadHistory();
+});
+elements.historyNext.addEventListener("click", () => {
+  state.historyOffset += state.historyPageSize;
+  loadHistory();
+});
+window.addEventListener("hashchange", () => setView(currentView(), {updateHash: false}));
+
+elements.historyAnchor.value = localAnchor(state.historyPeriod);
+elements.historyTimezone.textContent =
+  `统计时区：${state.historyTimezone}（跟随设备）`;
+updateHistoryAnchorControl();
 
 loadConfig().catch((error) => {
   setServiceState(false, "管理服务不可用");
   setResult(error.message, "error");
 });
-loadHistory();
+setView(currentView());

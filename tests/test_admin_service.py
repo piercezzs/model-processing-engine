@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -210,6 +211,67 @@ class AdminServiceTests(unittest.TestCase):
             self.assertEqual(failed.status_code, 502)
             self.assertEqual(history["summary"]["failed"], 1)
             self.assertEqual(history["items"][0]["error"], "probe failed")
+
+    def test_admin_execution_statistics_support_period_and_model_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings, engine = self._runtime(Path(temp_dir))
+            client = TestClient(
+                create_app(
+                    engine=engine,
+                    settings=settings,
+                    restart_scheduler=lambda _settings: None,
+                ),
+                client=("127.0.0.1", 50000),
+            )
+            headers = {"Host": "127.0.0.1:8787"}
+            csrf = client.get("/v1/admin/config", headers=headers).json()["csrfToken"]
+            mutation_headers = {
+                **headers,
+                "Origin": "http://127.0.0.1:8787",
+                "X-MPE-CSRF": csrf,
+            }
+            client.post(
+                "/v1/admin/providers/test",
+                json={
+                    "providerId": "mock",
+                    "type": "mock",
+                    "model": "schema-sample-v1",
+                },
+                headers=mutation_headers,
+            )
+            year = datetime.now(timezone.utc).strftime("%Y")
+
+            response = client.get(
+                "/v1/admin/execution-stats",
+                params={
+                    "period": "year",
+                    "anchor": year,
+                    "timezone": "UTC",
+                    "kind": "provider_test",
+                    "providerId": "mock",
+                    "model": "schema-sample-v1",
+                },
+                headers=headers,
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["summary"]["total"], 1)
+            self.assertEqual(payload["summary"]["providerTests"], 1)
+            self.assertEqual(payload["models"][0]["providerId"], "mock")
+            self.assertEqual(len(payload["series"]), 12)
+            self.assertEqual(
+                client.get(
+                    "/v1/admin/execution-stats",
+                    params={
+                        "period": "day",
+                        "anchor": "not-a-date",
+                        "timezone": "UTC",
+                    },
+                    headers=headers,
+                ).status_code,
+                400,
+            )
 
     def test_admin_is_disabled_in_remote_mode_and_for_foreign_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

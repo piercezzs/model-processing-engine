@@ -5,8 +5,12 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .exceptions import AsyncQueueFullError
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,9 @@ class SQLiteRuntimeStore:
                     namespace TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     task_version TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'task',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
                     envelope_json TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -94,8 +101,23 @@ class SQLiteRuntimeStore:
 
                 CREATE INDEX IF NOT EXISTS provider_call_execution_idx
                 ON provider_call_records(execution_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS async_execution_queue (
+                    execution_id TEXT PRIMARY KEY,
+                    request_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('queued', 'running')),
+                    enqueued_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    recovery_count INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(execution_id) REFERENCES execution_records(execution_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS async_execution_queue_status_idx
+                ON async_execution_queue(status, enqueued_at);
                 """
             )
+            _migrate_execution_history_schema(connection)
 
     def get_cache(self, namespace: str, key: str) -> CacheRecord | None:
         now = time.time()
@@ -239,36 +261,8 @@ class SQLiteRuntimeStore:
 
     def save_execution(self, envelope: dict[str, Any]) -> None:
         now = time.time()
-        task = envelope.get("task") if isinstance(envelope.get("task"), dict) else {}
-        execution_id = str(envelope.get("executionId") or "")
-        if not execution_id:
-            raise ValueError("executionId is required")
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO execution_records (
-                    execution_id, status, namespace, task_id, task_version,
-                    envelope_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(execution_id) DO UPDATE SET
-                    status = excluded.status,
-                    namespace = excluded.namespace,
-                    task_id = excluded.task_id,
-                    task_version = excluded.task_version,
-                    envelope_json = excluded.envelope_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    execution_id,
-                    str(envelope.get("status") or "failed"),
-                    str(task.get("namespace") or ""),
-                    str(task.get("id") or ""),
-                    str(task.get("version") or ""),
-                    _json_text(envelope),
-                    now,
-                    now,
-                ),
-            )
+            _upsert_execution(connection, envelope, now=now)
 
     def get_execution(self, execution_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -277,6 +271,195 @@ class SQLiteRuntimeStore:
                 (execution_id,),
             ).fetchone()
         return _json_object(row["envelope_json"]) if row else None
+
+    def enqueue_async_execution(
+        self,
+        *,
+        envelope: dict[str, Any],
+        request: dict[str, Any],
+        capacity: int,
+    ) -> None:
+        now = time.time()
+        execution_id = str(envelope.get("executionId") or "")
+        if not execution_id:
+            raise ValueError("executionId is required")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM async_execution_queue"
+            ).fetchone()
+            if int(row["count"] if row else 0) >= max(1, capacity):
+                raise AsyncQueueFullError(
+                    f"Async execution queue is full (capacity {max(1, capacity)})"
+                )
+            _upsert_execution(connection, envelope, now=now)
+            connection.execute(
+                """
+                INSERT INTO async_execution_queue (
+                    execution_id, request_json, status, enqueued_at, updated_at,
+                    recovery_count
+                ) VALUES (?, ?, 'queued', ?, ?, 0)
+                """,
+                (execution_id, _json_text(request), now, now),
+            )
+
+    def claim_next_async_execution(
+        self,
+    ) -> tuple[str, dict[str, Any]] | None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT execution_id, request_json
+                FROM async_execution_queue
+                WHERE status = 'queued'
+                ORDER BY enqueued_at, execution_id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            execution_id = str(row["execution_id"])
+            connection.execute(
+                """
+                UPDATE async_execution_queue
+                SET status = 'running', updated_at = ?
+                WHERE execution_id = ?
+                """,
+                (now, execution_id),
+            )
+            execution_row = connection.execute(
+                "SELECT envelope_json FROM execution_records WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if execution_row:
+                envelope = _json_object(execution_row["envelope_json"])
+                envelope["status"] = "running"
+                envelope["progress"] = {"event": "dequeued"}
+                _upsert_execution(connection, envelope, now=now)
+            return execution_id, _json_object(row["request_json"])
+
+    def finish_async_execution(self, execution_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM async_execution_queue WHERE execution_id = ?",
+                (execution_id,),
+            )
+
+    def fail_async_execution(self, execution_id: str, *, error: str) -> None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT envelope_json FROM execution_records WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if row:
+                envelope = _json_object(row["envelope_json"])
+                envelope.update(
+                    {
+                        "status": "failed",
+                        "error": str(error)[:1000],
+                        "progress": {"event": "failed"},
+                    }
+                )
+                _upsert_execution(connection, envelope, now=now)
+            connection.execute(
+                "DELETE FROM async_execution_queue WHERE execution_id = ?",
+                (execution_id,),
+            )
+
+    def async_queue_stats(self) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM async_execution_queue
+                GROUP BY status
+                """
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        queued = counts.get("queued", 0)
+        running = counts.get("running", 0)
+        return {"queued": queued, "running": running, "total": queued + running}
+
+    def has_queued_async_executions(self) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM async_execution_queue
+                WHERE status = 'queued'
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
+    def recover_async_executions(self) -> dict[str, int]:
+        now = time.time()
+        recovered = 0
+        orphaned = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT queue.execution_id, queue.status, records.status AS record_status,
+                    records.envelope_json
+                FROM async_execution_queue AS queue
+                JOIN execution_records AS records
+                    ON records.execution_id = queue.execution_id
+                ORDER BY queue.enqueued_at
+                """
+            ).fetchall()
+            for row in rows:
+                execution_id = str(row["execution_id"])
+                if str(row["record_status"]) in {"succeeded", "failed"}:
+                    connection.execute(
+                        "DELETE FROM async_execution_queue WHERE execution_id = ?",
+                        (execution_id,),
+                    )
+                    continue
+                was_running = str(row["status"]) == "running"
+                envelope = _json_object(row["envelope_json"])
+                envelope["status"] = "queued"
+                envelope["error"] = None
+                if was_running:
+                    recovered += 1
+                    envelope["progress"] = {"event": "recovered_after_restart"}
+                _upsert_execution(connection, envelope, now=now)
+                connection.execute(
+                    """
+                    UPDATE async_execution_queue
+                    SET status = 'queued', updated_at = ?,
+                        recovery_count = recovery_count + ?
+                    WHERE execution_id = ?
+                    """,
+                    (now, int(was_running), execution_id),
+                )
+
+            orphan_rows = connection.execute(
+                """
+                SELECT records.execution_id, records.envelope_json
+                FROM execution_records AS records
+                LEFT JOIN async_execution_queue AS queue
+                    ON queue.execution_id = records.execution_id
+                WHERE records.status IN ('queued', 'running')
+                    AND queue.execution_id IS NULL
+                """
+            ).fetchall()
+            for row in orphan_rows:
+                envelope = _json_object(row["envelope_json"])
+                envelope.update(
+                    {
+                        "status": "failed",
+                        "error": "Execution was interrupted before durable queue recovery was available",
+                        "progress": {"event": "failed"},
+                    }
+                )
+                _upsert_execution(connection, envelope, now=now)
+                orphaned += 1
+        return {"recovered": recovered, "orphaned": orphaned}
 
     def save_provider_call(self, record: dict[str, Any]) -> None:
         call_id = str(record.get("callId") or "")
@@ -315,16 +498,40 @@ class SQLiteRuntimeStore:
         limit: int = 50,
         offset: int = 0,
         namespace: str | None = None,
+        task_id: str | None = None,
         status: str | None = None,
+        kind: str | None = None,
+        provider_id: str | None = None,
+        model: str | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
     ) -> dict[str, Any]:
         clauses: list[str] = []
         parameters: list[Any] = []
         if namespace:
             clauses.append("namespace = ?")
             parameters.append(namespace)
+        if task_id:
+            clauses.append("task_id = ?")
+            parameters.append(task_id)
         if status:
             clauses.append("status = ?")
             parameters.append(status)
+        if kind:
+            clauses.append("kind = ?")
+            parameters.append(kind)
+        if provider_id:
+            clauses.append("provider_id = ?")
+            parameters.append(provider_id)
+        if model:
+            clauses.append("model = ?")
+            parameters.append(model)
+        if created_from is not None:
+            clauses.append("created_at >= ?")
+            parameters.append(float(created_from))
+        if created_to is not None:
+            clauses.append("created_at < ?")
+            parameters.append(float(created_to))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         bounded_limit = max(1, min(int(limit), 200))
         bounded_offset = max(0, int(offset))
@@ -335,15 +542,18 @@ class SQLiteRuntimeStore:
             ).fetchone()
             page_rows = connection.execute(
                 f"""
-                SELECT execution_id, envelope_json
+                SELECT execution_id, envelope_json, created_at
                 FROM execution_records{where}
-                ORDER BY updated_at DESC, execution_id DESC
+                ORDER BY created_at DESC, execution_id DESC
                 LIMIT ? OFFSET ?
                 """,
                 (*parameters, bounded_limit, bounded_offset),
             ).fetchall()
             aggregate_rows = connection.execute(
-                f"SELECT execution_id, envelope_json FROM execution_records{where}",
+                f"""
+                SELECT execution_id, envelope_json, created_at
+                FROM execution_records{where}
+                """,
                 tuple(parameters),
             ).fetchall()
             provider_calls = _provider_calls_by_execution(
@@ -354,6 +564,7 @@ class SQLiteRuntimeStore:
             _execution_summary(
                 _json_object(row["envelope_json"]),
                 provider_calls.get(str(row["execution_id"]), []),
+                recorded_at=float(row["created_at"]),
             )
             for row in page_rows
         ]
@@ -361,6 +572,7 @@ class SQLiteRuntimeStore:
             _execution_summary(
                 _json_object(row["envelope_json"]),
                 provider_calls.get(str(row["execution_id"]), []),
+                recorded_at=float(row["created_at"]),
             )
             for row in aggregate_rows
         ]
@@ -374,6 +586,76 @@ class SQLiteRuntimeStore:
                 "total": total,
                 "hasMore": bounded_offset + len(items) < total,
             },
+        }
+
+    def execution_statistics(
+        self,
+        *,
+        period: str,
+        anchor: str,
+        timezone_name: str,
+        namespace: str | None = None,
+        task_id: str | None = None,
+        status: str | None = None,
+        kind: str | None = "task",
+        provider_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        window = _period_window(period, anchor, timezone_name)
+        clauses = ["created_at >= ?", "created_at < ?"]
+        parameters: list[Any] = [window["startTimestamp"], window["endTimestamp"]]
+        if namespace:
+            clauses.append("namespace = ?")
+            parameters.append(namespace)
+        if task_id:
+            clauses.append("task_id = ?")
+            parameters.append(task_id)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        if kind:
+            clauses.append("kind = ?")
+            parameters.append(kind)
+        where = f" WHERE {' AND '.join(clauses)}"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT execution_id, envelope_json, created_at
+                FROM execution_records{where}
+                ORDER BY created_at, execution_id
+                """,
+                tuple(parameters),
+            ).fetchall()
+            provider_calls = _provider_calls_by_execution(
+                connection,
+                [str(row["execution_id"]) for row in rows],
+            )
+        base_items = [
+            _execution_summary(
+                _json_object(row["envelope_json"]),
+                provider_calls.get(str(row["execution_id"]), []),
+                recorded_at=float(row["created_at"]),
+            )
+            for row in rows
+        ]
+        items = [
+            item
+            for item in base_items
+            if (not provider_id or item["provider"]["id"] == provider_id)
+            and (not model or item["provider"]["model"] == model)
+        ]
+        return {
+            "period": {
+                "kind": period,
+                "anchor": anchor,
+                "timezone": timezone_name,
+                "start": window["start"].isoformat(),
+                "end": window["end"].isoformat(),
+            },
+            "summary": _execution_aggregate(items),
+            "series": _execution_series(items, window=window),
+            "models": _execution_model_breakdown(items),
+            "facets": _execution_facets(base_items),
         }
 
     def recover_incomplete_executions(self) -> int:
@@ -400,6 +682,125 @@ class SQLiteRuntimeStore:
             return len(rows)
 
 
+def _migrate_execution_history_schema(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(execution_records)").fetchall()
+    }
+    definitions = {
+        "kind": "TEXT NOT NULL DEFAULT 'task'",
+        "provider_id": "TEXT NOT NULL DEFAULT ''",
+        "model": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in definitions.items():
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE execution_records ADD COLUMN {name} {definition}"
+            )
+
+    rows = connection.execute(
+        """
+        SELECT execution_id, envelope_json, kind, provider_id, model
+        FROM execution_records
+        """
+    ).fetchall()
+    updates: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        envelope = _json_object(row["envelope_json"])
+        task = envelope.get("task") if isinstance(envelope.get("task"), dict) else {}
+        provider = (
+            envelope.get("provider")
+            if isinstance(envelope.get("provider"), dict)
+            else {}
+        )
+        expected = (
+            str(task.get("kind") or "task"),
+            str(provider.get("id") or ""),
+            str(provider.get("model") or ""),
+        )
+        actual = (
+            str(row["kind"]),
+            str(row["provider_id"]),
+            str(row["model"]),
+        )
+        if actual != expected:
+            updates.append((*expected, str(row["execution_id"])))
+    connection.executemany(
+        """
+        UPDATE execution_records
+        SET kind = ?, provider_id = ?, model = ?
+        WHERE execution_id = ?
+        """,
+        updates,
+    )
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS execution_records_created_idx
+        ON execution_records(created_at);
+
+        CREATE INDEX IF NOT EXISTS execution_records_namespace_task_created_idx
+        ON execution_records(namespace, task_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS execution_records_provider_model_created_idx
+        ON execution_records(provider_id, model, created_at);
+
+        CREATE INDEX IF NOT EXISTS execution_records_kind_created_idx
+        ON execution_records(kind, created_at);
+
+        CREATE INDEX IF NOT EXISTS provider_call_provider_model_created_idx
+        ON provider_call_records(provider_id, model, created_at);
+        """
+    )
+
+
+def _upsert_execution(
+    connection: sqlite3.Connection,
+    envelope: dict[str, Any],
+    *,
+    now: float,
+) -> None:
+    task = envelope.get("task") if isinstance(envelope.get("task"), dict) else {}
+    provider = (
+        envelope.get("provider")
+        if isinstance(envelope.get("provider"), dict)
+        else {}
+    )
+    execution_id = str(envelope.get("executionId") or "")
+    if not execution_id:
+        raise ValueError("executionId is required")
+    connection.execute(
+        """
+        INSERT INTO execution_records (
+            execution_id, status, namespace, task_id, task_version,
+            kind, provider_id, model, envelope_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(execution_id) DO UPDATE SET
+            status = excluded.status,
+            namespace = excluded.namespace,
+            task_id = excluded.task_id,
+            task_version = excluded.task_version,
+            kind = excluded.kind,
+            provider_id = excluded.provider_id,
+            model = excluded.model,
+            envelope_json = excluded.envelope_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            execution_id,
+            str(envelope.get("status") or "failed"),
+            str(task.get("namespace") or ""),
+            str(task.get("id") or ""),
+            str(task.get("version") or ""),
+            str(task.get("kind") or "task"),
+            str(provider.get("id") or ""),
+            str(provider.get("model") or ""),
+            _json_text(envelope),
+            now,
+            now,
+        ),
+    )
+
+
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -412,6 +813,8 @@ def _json_object(value: str) -> dict[str, Any]:
 def _execution_summary(
     envelope: dict[str, Any],
     provider_calls: list[dict[str, Any]] | None = None,
+    *,
+    recorded_at: float | None = None,
 ) -> dict[str, Any]:
     task = envelope.get("task") if isinstance(envelope.get("task"), dict) else {}
     provider = (
@@ -433,6 +836,10 @@ def _execution_summary(
             "providerCallCount": len(calls),
             "transportRetries": sum(
                 max(0, _non_negative_int(call.get("attempts")) - 1)
+                for call in calls
+            ),
+            "contractRepairs": sum(
+                int(call.get("purpose") == "contract_repair")
                 for call in calls
             ),
         }
@@ -469,7 +876,10 @@ def _execution_summary(
             "source": str(usage.get("source") or ""),
         },
         "timing": {
-            "createdAt": str(timing.get("createdAt") or ""),
+            "createdAt": str(
+                timing.get("createdAt")
+                or _timestamp_iso(recorded_at)
+            ),
             "completedAt": str(timing.get("completedAt") or ""),
             "elapsedMs": _non_negative_int(timing.get("elapsedMs")),
             "providerElapsedMs": _non_negative_int(
@@ -480,6 +890,9 @@ def _execution_summary(
             ),
             "transportRetries": _non_negative_int(
                 timing.get("transportRetries")
+            ),
+            "contractRepairs": _non_negative_int(
+                timing.get("contractRepairs")
             ),
         },
         "error": call_error or _redacted_history_error(envelope.get("error")),
@@ -500,7 +913,10 @@ def _execution_aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
     provider_cache_hit_executions = 0
     provider_calls = 0
     transport_retries = 0
+    contract_repairs = 0
     provider_tests = 0
+    elapsed_total = 0
+    elapsed_available = 0
     for item in items:
         status = item.get("status")
         if status in statuses:
@@ -518,16 +934,282 @@ def _execution_aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
         timing = item.get("timing", {})
         provider_calls += _non_negative_int(timing.get("providerCallCount"))
         transport_retries += _non_negative_int(timing.get("transportRetries"))
+        contract_repairs += _non_negative_int(timing.get("contractRepairs"))
+        elapsed_ms = _non_negative_int(timing.get("elapsedMs"))
+        if elapsed_ms:
+            elapsed_total += elapsed_ms
+            elapsed_available += 1
+    terminal = statuses["succeeded"] + statuses["failed"]
     return {
         "total": len(items),
         **statuses,
+        "successRate": round(
+            statuses["succeeded"] / terminal * 100,
+            1,
+        ) if terminal else 0.0,
         "providerTests": provider_tests,
         "cacheHits": cache_hits,
         "providerCacheHitExecutions": provider_cache_hit_executions,
         "providerCallCount": provider_calls,
         "transportRetries": transport_retries,
+        "contractRepairs": contract_repairs,
+        "averageElapsedMs": round(
+            elapsed_total / elapsed_available,
+        ) if elapsed_available else 0,
         "usageAvailableExecutions": usage_available,
         "usage": usage,
+    }
+
+
+def _timestamp_iso(value: float | None) -> str:
+    if value is None:
+        return ""
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+def _period_window(
+    period: str,
+    anchor: str,
+    timezone_name: str,
+) -> dict[str, Any]:
+    try:
+        local_zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Unknown timezone: {timezone_name}") from exc
+
+    try:
+        if period == "day":
+            parsed = datetime.strptime(anchor, "%Y-%m-%d")
+            start = datetime(
+                parsed.year,
+                parsed.month,
+                parsed.day,
+                tzinfo=local_zone,
+            )
+            end = start + timedelta(days=1)
+        elif period == "month":
+            parsed = datetime.strptime(anchor, "%Y-%m")
+            start = datetime(parsed.year, parsed.month, 1, tzinfo=local_zone)
+            end = (
+                datetime(parsed.year + 1, 1, 1, tzinfo=local_zone)
+                if parsed.month == 12
+                else datetime(parsed.year, parsed.month + 1, 1, tzinfo=local_zone)
+            )
+        elif period == "year":
+            parsed = datetime.strptime(anchor, "%Y")
+            start = datetime(parsed.year, 1, 1, tzinfo=local_zone)
+            end = datetime(parsed.year + 1, 1, 1, tzinfo=local_zone)
+        else:
+            raise ValueError("period must be day, month, or year")
+    except ValueError as exc:
+        if str(exc).startswith("period must"):
+            raise
+        raise ValueError(f"Invalid {period} anchor: {anchor}") from exc
+    return {
+        "period": period,
+        "timezone": local_zone,
+        "start": start,
+        "end": end,
+        "startTimestamp": start.timestamp(),
+        "endTimestamp": end.timestamp(),
+    }
+
+
+def _execution_datetime(
+    item: dict[str, Any],
+    local_zone: ZoneInfo,
+) -> datetime | None:
+    value = str(item.get("timing", {}).get("createdAt") or "")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(local_zone)
+
+
+def _execution_series(
+    items: list[dict[str, Any]],
+    *,
+    window: dict[str, Any],
+) -> list[dict[str, Any]]:
+    period = str(window["period"])
+    start = window["start"]
+    end = window["end"]
+    local_zone = window["timezone"]
+    buckets: list[dict[str, Any]] = []
+    if period == "day":
+        for hour in range(24):
+            buckets.append(
+                {
+                    "key": f"{hour:02d}",
+                    "label": f"{hour:02d}:00",
+                    "executions": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "providerCalls": 0,
+                    "totalTokens": 0,
+                    "cacheReadInputTokens": 0,
+                }
+            )
+        key_for = lambda value: value.hour
+    elif period == "month":
+        day_count = (end.date() - start.date()).days
+        for day in range(1, day_count + 1):
+            buckets.append(
+                {
+                    "key": f"{day:02d}",
+                    "label": f"{day}日",
+                    "executions": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "providerCalls": 0,
+                    "totalTokens": 0,
+                    "cacheReadInputTokens": 0,
+                }
+            )
+        key_for = lambda value: value.day - 1
+    else:
+        for month in range(1, 13):
+            buckets.append(
+                {
+                    "key": f"{month:02d}",
+                    "label": f"{month}月",
+                    "executions": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "providerCalls": 0,
+                    "totalTokens": 0,
+                    "cacheReadInputTokens": 0,
+                }
+            )
+        key_for = lambda value: value.month - 1
+
+    for item in items:
+        local_time = _execution_datetime(item, local_zone)
+        if local_time is None:
+            continue
+        index = key_for(local_time)
+        if not 0 <= index < len(buckets):
+            continue
+        bucket = buckets[index]
+        bucket["executions"] += 1
+        status = item.get("status")
+        if status in {"succeeded", "failed"}:
+            bucket[status] += 1
+        timing = item.get("timing", {})
+        usage = item.get("usage", {})
+        bucket["providerCalls"] += _non_negative_int(
+            timing.get("providerCallCount")
+        )
+        bucket["totalTokens"] += _non_negative_int(usage.get("totalTokens"))
+        bucket["cacheReadInputTokens"] += _non_negative_int(
+            usage.get("cacheReadInputTokens")
+        )
+    return buckets
+
+
+def _execution_model_breakdown(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        provider = item.get("provider", {})
+        key = (
+            str(provider.get("id") or "unknown"),
+            str(provider.get("model") or "unknown"),
+        )
+        group = groups.setdefault(
+            key,
+            {
+                "providerId": key[0],
+                "model": key[1],
+                "executions": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "providerCalls": 0,
+                "elapsedMs": 0,
+                "elapsedAvailable": 0,
+                "usage": {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                    "cacheReadInputTokens": 0,
+                },
+            },
+        )
+        group["executions"] += 1
+        status = item.get("status")
+        if status in {"succeeded", "failed"}:
+            group[status] += 1
+        timing = item.get("timing", {})
+        group["providerCalls"] += _non_negative_int(
+            timing.get("providerCallCount")
+        )
+        elapsed_ms = _non_negative_int(timing.get("elapsedMs"))
+        if elapsed_ms:
+            group["elapsedMs"] += elapsed_ms
+            group["elapsedAvailable"] += 1
+        usage = item.get("usage", {})
+        for field in group["usage"]:
+            group["usage"][field] += _non_negative_int(usage.get(field))
+
+    result: list[dict[str, Any]] = []
+    for group in groups.values():
+        terminal = group["succeeded"] + group["failed"]
+        result.append(
+            {
+                "providerId": group["providerId"],
+                "model": group["model"],
+                "executions": group["executions"],
+                "succeeded": group["succeeded"],
+                "failed": group["failed"],
+                "providerCalls": group["providerCalls"],
+                "successRate": round(
+                    group["succeeded"] / terminal * 100,
+                    1,
+                ) if terminal else 0.0,
+                "averageElapsedMs": round(
+                    group["elapsedMs"] / group["elapsedAvailable"],
+                ) if group["elapsedAvailable"] else 0,
+                "usage": group["usage"],
+            }
+        )
+    return sorted(
+        result,
+        key=lambda item: (
+            -int(item["providerCalls"]),
+            -int(item["usage"]["totalTokens"]),
+            str(item["providerId"]).casefold(),
+            str(item["model"]).casefold(),
+        ),
+    )
+
+
+def _execution_facets(items: list[dict[str, Any]]) -> dict[str, Any]:
+    providers: dict[str, set[str]] = {}
+    for item in items:
+        provider = item.get("provider", {})
+        provider_id = str(provider.get("id") or "")
+        model = str(provider.get("model") or "")
+        if provider_id:
+            providers.setdefault(provider_id, set())
+            if model:
+                providers[provider_id].add(model)
+    return {
+        "providers": [
+            {
+                "id": provider_id,
+                "models": sorted(models, key=str.casefold),
+            }
+            for provider_id, models in sorted(
+                providers.items(),
+                key=lambda pair: pair[0].casefold(),
+            )
+        ]
     }
 
 
@@ -549,7 +1231,7 @@ def _provider_calls_by_execution(
         placeholders = ",".join("?" for _value in chunk)
         rows = connection.execute(
             f"""
-            SELECT execution_id, status, usage_json, attempts, elapsed_ms, error
+            SELECT execution_id, purpose, status, usage_json, attempts, elapsed_ms, error
             FROM provider_call_records
             WHERE execution_id IN ({placeholders})
             ORDER BY execution_id, sequence, created_at
@@ -560,6 +1242,7 @@ def _provider_calls_by_execution(
             grouped.setdefault(str(row["execution_id"]), []).append(
                 {
                     "status": str(row["status"]),
+                    "purpose": str(row["purpose"]),
                     "usage": _json_object(row["usage_json"]),
                     "attempts": int(row["attempts"]),
                     "elapsedMs": int(row["elapsed_ms"]),

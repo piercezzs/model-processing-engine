@@ -69,11 +69,15 @@ configuration:
 http://127.0.0.1:8787/admin
 ```
 
-The same page shows a redacted execution history with aggregate Token usage,
-Provider call counts, retry counts, MPE result-cache hits, and Provider prompt
-cache usage. These are separate signals: an MPE result-cache hit skips the
-Provider call, while a Provider prompt-cache hit reuses input-prefix Token but
-still generates a new result. History rows never include model result bodies.
+The page separates Provider configuration and redacted execution history into
+top-level tabs. Execution history supports day, month, and year periods in the
+browser's IANA timezone, plus formal-task/connection-test, Provider, and model
+filters. Its summary and per-model breakdown distinguish execution count,
+actual Provider call count, Token usage, transport retries, contract repairs,
+MPE result-cache hits, and Provider prompt-cache usage. These are separate
+signals: an MPE result-cache hit skips the Provider call, while a Provider
+prompt-cache hit reuses input-prefix Token but still generates a new result.
+History rows never include model result bodies.
 Provider connection tests are recorded in the same technical ledger, including
 usage when the Provider returns it. Provider-call rows are captured before
 output-schema validation, so consumed Token remains accounted for even when
@@ -93,6 +97,11 @@ transport retry count live under advanced connection settings. The same section
 also sets the Provider's maximum concurrent in-flight requests. Actual
 concurrency is demand-driven: one pending execution uses one slot, while larger
 workloads queue after the configured Provider limit.
+
+The advanced **Provider native JSON Schema** switch is an explicit capability
+declaration, not automatic detection. Enable it only when the selected platform
+and model support Chat Completions `response_format.type=json_schema`. MPE still
+validates every returned object locally.
 
 MPE first tests the exact submitted Provider, model list, default model, and key
 in memory. Only a matching, unexpired successful test can be saved and
@@ -159,7 +168,8 @@ tasks/example/
   "runtimeDefaults": {
     "providerId": "openai-compatible",
     "model": "your-model-id",
-    "temperature": 0.1
+    "temperature": 0.1,
+    "contractRetries": 1
   }
 }
 ```
@@ -178,6 +188,13 @@ the caller remains responsible for authoritative business data.
 `runtime.forceRefresh` bypasses cache reads. After a successful provider call and
 output validation, the engine replaces the matching reusable cache entry. A
 failed refresh leaves the previous cache entry unchanged.
+
+`runtimeDefaults.contractRetries` controls bounded output-contract repair
+requests and defaults to `1`; an execution may override it with
+`runtime.contractRetries` from `0` through `2`. Transport retries and contract
+repairs are separate counters. A repair reuses the original task/input prefix,
+adds the rejected object plus a bounded validation diagnostic, and is recorded
+as another real Provider call.
 
 Sensitive tasks must execute synchronously. Their result is returned to that
 caller but omitted from persistent execution records as well as the result
@@ -278,6 +295,7 @@ Available routes:
 - `GET /admin` (loopback management page)
 - `GET /v1/admin/config` (masked local configuration)
 - `GET /v1/admin/executions` (loopback-only redacted history)
+- `GET /v1/admin/execution-stats` (time-bounded aggregates and model breakdown)
 - `POST /v1/admin/providers/test` (same-origin and CSRF protected)
 - `POST /v1/admin/providers/models` (in-memory Provider model discovery)
 - `POST /v1/admin/providers/apply` (same-origin and CSRF protected)
@@ -293,9 +311,20 @@ The default host is `127.0.0.1`. Non-loopback binding requires both
 deployments. Use a reverse proxy with TLS if the service crosses a trusted
 machine boundary.
 
-Use one service process per `MPE_DATA_DIR`. Service startup marks queued or
-running records from the previous runtime as interrupted. Separate callers may
-share a service, but separate service processes should use separate data paths.
+Use one service process per `MPE_DATA_DIR`. Asynchronous requests are written to
+the same SQLite database before the API returns. A fixed worker pool claims work
+in FIFO order; a restart requeues work that was running and continues queued
+requests. Legacy or incomplete records that have no durable request payload are
+marked interrupted instead of being guessed. `MPE_ASYNC_WORKERS` defaults to
+`4`, and `MPE_ASYNC_QUEUE_CAPACITY` defaults to `100`; a full queue returns HTTP
+429. Queue capacity includes both queued and running requests.
+
+Sensitive tasks remain synchronous because a recoverable queue must persist the
+request until it reaches a terminal state. Completed queue rows are deleted.
+Recovery is at-least-once for a request interrupted before its terminal
+execution snapshot is committed; already-terminal snapshots are not rerun.
+Separate callers may share a service, but separate service processes should use
+separate data paths.
 
 Health includes the application version, API version, stable runtime instance
 ID, and process ID so local service management can verify process identity.
@@ -311,6 +340,9 @@ ID, and process ID so local service management can verify process identity.
 Provider configuration may declare `availableModels`, `capabilities`, and
 `maxConcurrency`. The `/v1/providers` response exposes those non-secret
 declarations while preserving the original provider-ID list for compatibility.
+`structured_json` uses JSON-object mode. `native_json_schema` sends the task
+output schema through the Provider's strict JSON Schema request field and must
+only be declared for known-compatible platform/model combinations.
 `maxConcurrency` is enforced independently for each Provider across all callers.
 The environment-level `MPE_MAX_PROVIDER_CONCURRENCY` remains a service-wide
 safety ceiling; the effective Provider limit is the smaller of the two.
@@ -344,8 +376,10 @@ Add `--runtime` only when a managed-service restart is intended:
 
 Runtime mode uses the verified process manager to restart MPE, checks service
 identity and status, probes the redacted history contract, and confirms that
-the current admin script is served with cache-safe headers. Browser-based visual
-verification remains a separate manual or agent-assisted check.
+the current admin script is served with cache-safe headers. It also submits one
+offline mock request through the persistent asynchronous queue and polls it to a
+successful terminal state. Browser-based visual verification remains a separate
+manual or agent-assisted check.
 
 The automated suite uses only the mock provider or mocked transports. A real
 provider acceptance call is intentionally separate because it requires a local

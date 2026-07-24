@@ -24,6 +24,8 @@ class Settings:
     allow_remote: bool
     max_provider_concurrency: int
     max_request_bytes: int
+    async_worker_count: int = 4
+    async_queue_capacity: int = 100
     api_token: str = ""
     log_dir: Path | None = None
     run_dir: Path | None = None
@@ -101,6 +103,18 @@ def load_settings(root: str | Path | None = None) -> Settings:
         minimum=1024,
         maximum=64 * 1024 * 1024,
     )
+    async_worker_count = _bounded_int(
+        "MPE_ASYNC_WORKERS",
+        default=4,
+        minimum=1,
+        maximum=64,
+    )
+    async_queue_capacity = _bounded_int(
+        "MPE_ASYNC_QUEUE_CAPACITY",
+        default=100,
+        minimum=1,
+        maximum=10_000,
+    )
     return Settings(
         root=resolved_root,
         provider_config_path=provider_config,
@@ -110,6 +124,8 @@ def load_settings(root: str | Path | None = None) -> Settings:
         allow_remote=allow_remote,
         max_provider_concurrency=max_concurrency,
         max_request_bytes=max_request_bytes,
+        async_worker_count=async_worker_count,
+        async_queue_capacity=async_queue_capacity,
         api_token=api_token,
         log_dir=log_dir,
         run_dir=run_dir,
