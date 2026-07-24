@@ -1,5 +1,17 @@
 # Model Processing Engine
 
+English | [简体中文](README.zh-CN.md)
+
+> [!IMPORTANT]
+> **Source-available, not open source.** Copyright (c) 2026 piercezzs. You may
+> download and run an unmodified copy locally for personal or internal use. You
+> may not modify, redistribute, republish, host for third parties, or release
+> derivative versions. See [LICENSE](LICENSE) for the complete terms.
+>
+> **Release status:** `0.1.0` is experimental and local-first. Public contracts
+> and operational behavior may change before a stable release. Remote,
+> production use has not been certified.
+
 Model Processing Engine (MPE) is a business-neutral runtime for structured model
 tasks. A calling project owns the prompt, schemas, taxonomy, cache semantics, and
 business persistence. MPE owns provider calls, retries, validation, concurrency,
@@ -384,6 +396,14 @@ manual or agent-assisted check.
 The automated suite uses only the mock provider or mocked transports. A real
 provider acceptance call is intentionally separate because it requires a local
 credential and may incur cost.
+
+## License
+
+MPE is proprietary source-available software, not open source. Unmodified local
+use is permitted for personal or internal purposes; modification,
+redistribution, republication, third-party hosting, and derivative releases are
+not permitted without prior written authorization from piercezzs. See
+[LICENSE](LICENSE).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ownership and design
 decisions.

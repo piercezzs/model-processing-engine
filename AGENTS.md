@@ -5,9 +5,9 @@
 This repository is a business-neutral runtime for executing externally supplied
 model tasks. It owns execution mechanics, not caller business semantics.
 
-Reference projects, including `global-intelligence-agent`, are read-only design
-evidence. This project must not import them, read their paths, depend on their
-schemas, or modify them. Real project integrations are separate follow-up work.
+This repository must remain standalone. It must not import another project's
+code, read project-specific paths, depend on project-specific schemas, or modify
+another project. Real project integrations are separate follow-up work.
 
 ## Ownership Boundary
 

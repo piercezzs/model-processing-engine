@@ -1,0 +1,51 @@
+MODEL PROCESSING ENGINE PROPRIETARY SOURCE-AVAILABLE LICENSE
+
+Copyright (c) 2026 piercezzs. All rights reserved.
+
+1. Permitted Use
+
+Permission is granted to download and run an unmodified copy of this software
+and its accompanying documentation (the "Software") on systems controlled by
+the user or the user's organization, solely for personal or internal use.
+Reasonable copies may be made only as necessary to install, run, or back up the
+unmodified Software for that permitted use.
+
+2. Restrictions
+
+Except for the limited permission stated above, no license or other rights are
+granted. Without prior written permission from piercezzs, you may not:
+
+- modify, adapt, translate, reverse engineer, or create derivative works of the
+  Software;
+- distribute, sublicense, sell, rent, lease, republish, mirror, upload, or
+  otherwise make the Software or any derivative work available to another
+  person or the public;
+- use the Software to provide a hosted, managed, or other service to third
+  parties; or
+- remove or alter copyright, license, attribution, or proprietary notices.
+
+3. Public Repository Notice
+
+Making the source code publicly visible does not make the Software open source
+and does not grant permissions beyond those expressly stated in this license.
+Rights required for GitHub to operate its service, including rights available
+to GitHub users through GitHub's Terms of Service, are unaffected.
+
+4. Third-Party Components
+
+Third-party dependencies are governed by their respective licenses. This
+license applies only to the Software owned by piercezzs.
+
+5. Termination
+
+The permission granted by this license terminates automatically upon breach of
+any of its terms. On termination, all copies of the Software made under this
+license must be deleted.
+
+6. Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT SHALL PIERCEZZS
+BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR ITS USE.
