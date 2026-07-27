@@ -66,7 +66,10 @@ start_mpe.bat
 
 The start wrapper finds Python 3.10 or newer, creates or repairs `.venv`, installs
 runtime dependencies from `pyproject.toml`, and records a dependency fingerprint
-so unchanged environments can be reused without reinstalling. It delegates
+so unchanged environments can be reused without reinstalling. If an existing
+`.venv` can already import MPE and its runtime dependencies and passes
+`pip check`, but only the fingerprint is missing, the wrapper adopts that
+environment without an unnecessary networked install. It delegates
 service identity and port-conflict handling to MPE's verified process manager
 and never terminates a process merely because port `8787` is occupied.
 

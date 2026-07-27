@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from model_processing_engine import process_manager
 from model_processing_engine.constants import API_VERSION, APP_ID
 from model_processing_engine.exceptions import ServiceManagerError
 from model_processing_engine.process_manager import (
@@ -170,6 +171,38 @@ class ProcessManagerTests(unittest.TestCase):
             self.assertTrue(result["alreadyRunning"])
             spawn.assert_not_called()
 
+    def test_windows_venv_launcher_records_the_health_process_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = _settings(Path(temp_dir))
+            launcher = _FakeProcess(43210)
+            service_pid = 54321
+            probes = [
+                HealthProbe(reachable=False),
+                _health(settings, service_pid),
+                _health(settings, service_pid),
+            ]
+            with patch(
+                "model_processing_engine.process_manager.os.name",
+                "nt",
+            ), patch(
+                "model_processing_engine.process_manager._probe_health",
+                side_effect=probes,
+            ), patch(
+                "model_processing_engine.process_manager._port_is_open",
+                return_value=False,
+            ), patch(
+                "model_processing_engine.process_manager._spawn_service",
+                return_value=launcher,
+            ), patch(
+                "model_processing_engine.process_manager._process_exists",
+                return_value=True,
+            ):
+                result = start_service(settings, timeout_seconds=1)
+            self.assertEqual(result["status"], "running")
+            self.assertEqual(result["pid"], service_pid)
+            record = json.loads(settings.service_record_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["pid"], service_pid)
+
     def test_start_failure_removes_new_service_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = _settings(Path(temp_dir))
@@ -187,6 +220,32 @@ class ProcessManagerTests(unittest.TestCase):
                 with self.assertRaises(ServiceManagerError):
                     start_service(settings, timeout_seconds=1)
             self.assertFalse(settings.service_record_path.exists())
+
+    def test_windows_invalid_pid_is_treated_as_not_running(self) -> None:
+        with patch(
+            "model_processing_engine.process_manager.os.kill",
+            side_effect=OSError(87, "The parameter is incorrect"),
+        ):
+            self.assertFalse(process_manager._process_exists(43210))
+        with patch(
+            "model_processing_engine.process_manager.os.kill",
+            side_effect=SystemError("kill returned a result with an exception set"),
+        ):
+            self.assertFalse(process_manager._process_exists(43210))
+
+    def test_windows_process_existence_uses_native_query(self) -> None:
+        with patch(
+            "model_processing_engine.process_manager.os.name",
+            "nt",
+        ), patch(
+            "model_processing_engine.process_manager._windows_process_exists",
+            return_value=True,
+        ) as native_query, patch(
+            "model_processing_engine.process_manager.os.kill",
+        ) as kill:
+            self.assertTrue(process_manager._process_exists(43210))
+        native_query.assert_called_once_with(43210)
+        kill.assert_not_called()
 
     def test_stop_refuses_to_signal_unverified_live_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -98,6 +98,16 @@ fi
 python_is_compatible "$VENV_PYTHON" || fail "The .venv Python must be 3.10 or newer"
 if environment_is_ready; then
     printf '[MPE] Reusing the ready .venv; pyproject.toml is unchanged\n'
+elif [ ! -f "$DEPENDENCY_STAMP" ] && \
+    python_is_compatible "$VENV_PYTHON" && \
+    "$VENV_PYTHON" -c \
+        'import fastapi, jsonschema, model_processing_engine, pydantic, uvicorn' \
+        >/dev/null 2>&1 && \
+    "$VENV_PYTHON" -m pip check >/dev/null 2>&1
+then
+    printf '[MPE] Adopting the existing ready .venv and recording its dependency state\n'
+    dependency_digest "$VENV_PYTHON" > "$DEPENDENCY_STAMP" || \
+        fail "Could not record the dependency state"
 else
     if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
         "$VENV_PYTHON" -m ensurepip --upgrade || fail "Could not repair pip in .venv"

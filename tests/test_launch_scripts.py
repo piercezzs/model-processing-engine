@@ -22,6 +22,7 @@ class LaunchScriptContractTest(unittest.TestCase):
             self.assertIn("pyproject.toml", content)
             self.assertIn("pip install", content)
             self.assertIn("mpe-pyproject.sha256", content)
+            self.assertIn("Adopting the existing ready .venv", content)
             self.assertIn("model_processing_engine.cli start", content)
             self.assertIn("model_processing_engine.cli status", content)
             self.assertIn("model_processing_engine.cli admin", content)
@@ -45,6 +46,12 @@ class LaunchScriptContractTest(unittest.TestCase):
             content = self._read(name)
             self.assertIn("model_processing_engine.cli stop", content)
             self.assertIn("model_processing_engine.cli status", content)
+
+    def test_windows_digest_does_not_use_fragile_for_command_capture(self) -> None:
+        windows = self._read("start_mpe.bat")
+        self.assertIn("stamp.read_text", windows)
+        self.assertIn("write_text(hashlib.sha256", windows)
+        self.assertNotIn("for /f \"delims=\" %%H", windows)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
@@ -217,6 +218,26 @@ def _start_locked(settings: Settings, *, timeout_seconds: float) -> dict[str, ob
         probe = _probe_health(settings)
         if _health_matches(settings, probe.payload, expected_pid=process.pid):
             return service_status(settings)
+        health_pid = _health_pid(probe.payload)
+        if (
+            os.name == "nt"
+            and health_pid is not None
+            and _health_matches(settings, probe.payload)
+            and process.poll() is None
+        ):
+            # A Windows venv python.exe launcher can remain as a parent process
+            # while the base interpreter hosts the service under a different PID.
+            # The authenticated health response is the authoritative service PID.
+            record = ServiceRecord(
+                pid=health_pid,
+                instance_id=record.instance_id,
+                root=record.root,
+                host=record.host,
+                port=record.port,
+                started_at=record.started_at,
+            )
+            _write_service_record(settings.service_record_path, record)
+            return service_status(settings)
         time.sleep(0.1)
 
     _terminate_spawned_process(process)
@@ -354,13 +375,36 @@ def _port_is_open(settings: Settings) -> bool:
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_exists(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except (OSError, SystemError):
+        # Windows may report an exited or otherwise invalid PID as WinError 87,
+        # and some Python builds surface that failure as SystemError.
+        return False
     return True
+
+
+def _windows_process_exists(pid: int) -> bool:
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == 5
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _spawn_service(settings: Settings, log_stream: BinaryIO) -> subprocess.Popen[bytes]:
