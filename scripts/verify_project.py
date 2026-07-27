@@ -47,9 +47,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Restart the managed loopback service and probe its API and admin assets.",
     )
+    parser.add_argument(
+        "--check-github-yaml",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
 
     try:
+        if args.check_github_yaml:
+            _verify_github_yaml(PROJECT_ROOT)
+            return 0
         with tempfile.TemporaryDirectory(prefix="mpe-verify-pycache-") as pycache_dir:
             deterministic_environment = _project_environment(
                 {"PYTHONPYCACHEPREFIX": pycache_dir}
@@ -74,6 +82,7 @@ def _deterministic_steps(
     python = sys.executable
     node = _required_executable("node")
     git = _required_executable("git")
+    uv = _required_executable("uv")
     return (
         VerificationStep(
             "Python unit tests",
@@ -83,6 +92,20 @@ def _deterministic_steps(
         VerificationStep(
             "Python compile check",
             (python, "-m", "compileall", "-q", "src", "tests"),
+            environment,
+        ),
+        VerificationStep(
+            "Locked dependency resolution",
+            (uv, "lock", "--check"),
+            environment,
+        ),
+        VerificationStep(
+            "GitHub YAML parsing",
+            (
+                python,
+                str(Path(__file__).resolve()),
+                "--check-github-yaml",
+            ),
             environment,
         ),
         VerificationStep(
@@ -113,6 +136,43 @@ def _deterministic_steps(
             environment,
         ),
     )
+
+
+def _verify_github_yaml(project_root: Path) -> None:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise VerificationError(
+            "PyYAML is required; install the project dev dependencies"
+        ) from exc
+
+    github_dir = project_root / ".github"
+    paths = tuple(
+        sorted(
+            {
+                *github_dir.rglob("*.yaml"),
+                *github_dir.rglob("*.yml"),
+            }
+        )
+    )
+    if not paths:
+        raise VerificationError("No GitHub YAML files were found")
+
+    for path in paths:
+        relative_path = path.relative_to(project_root)
+        try:
+            documents = tuple(
+                yaml.compose_all(
+                    path.read_text(encoding="utf-8"),
+                    Loader=yaml.SafeLoader,
+                )
+            )
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise VerificationError(f"Could not parse YAML: {relative_path}") from exc
+        if len(documents) != 1 or not isinstance(documents[0], yaml.nodes.MappingNode):
+            raise VerificationError(
+                f"GitHub YAML must contain one top-level mapping: {relative_path}"
+            )
 
 
 def _runtime_steps(

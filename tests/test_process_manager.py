@@ -12,6 +12,7 @@ from model_processing_engine.exceptions import ServiceManagerError
 from model_processing_engine.process_manager import (
     HealthProbe,
     ServiceRecord,
+    _prepare_runtime_directories,
     service_status,
     start_service,
     stop_service,
@@ -74,6 +75,21 @@ def _record(settings: Settings, pid: int) -> None:
 
 
 class ProcessManagerTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not a Windows security boundary")
+    def test_runtime_directories_are_private_without_restricting_explicit_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "project-root"
+            root.mkdir(mode=0o755)
+            os.chmod(root, 0o755)
+            settings = _settings(root)
+
+            _prepare_runtime_directories(settings)
+
+            self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(settings.data_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(settings.service_log_path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(settings.service_record_path.parent.stat().st_mode & 0o777, 0o700)
+
     def test_status_reports_stopped_when_port_is_free(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = _settings(Path(temp_dir))

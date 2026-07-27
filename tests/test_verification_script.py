@@ -36,6 +36,8 @@ class VerificationScriptContractTests(unittest.TestCase):
             [
                 "Python unit tests",
                 "Python compile check",
+                "Locked dependency resolution",
+                "GitHub YAML parsing",
                 "Admin JavaScript syntax",
                 "Git whitespace and conflict markers",
                 "Example Task Pack contract",
@@ -43,10 +45,29 @@ class VerificationScriptContractTests(unittest.TestCase):
         )
         self.assertTrue(any("unittest discover" in command for command in commands))
         self.assertTrue(any("compileall" in command for command in commands))
+        self.assertTrue(any("uv lock --check" in command for command in commands))
+        self.assertTrue(any("--check-github-yaml" in command for command in commands))
         self.assertTrue(any("node --check" in command for command in commands))
         self.assertTrue(any("git diff --check" in command for command in commands))
         self.assertTrue(any("task validate" in command for command in commands))
         self.assertEqual(steps[0].command[0], sys.executable)
+
+    def test_github_yaml_parser_accepts_mappings_and_rejects_malformed_yaml(self) -> None:
+        module = _load_script()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            workflow = workflows / "ci.yml"
+            workflow.write_text("name: CI\non: [push]\njobs: {}\n", encoding="utf-8")
+            dependabot = root / ".github" / "dependabot.yaml"
+            dependabot.write_text("version: 2\nupdates: []\n", encoding="utf-8")
+
+            module._verify_github_yaml(root)
+
+            workflow.write_text("name: [\n", encoding="utf-8")
+            with self.assertRaisesRegex(module.VerificationError, "Could not parse YAML"):
+                module._verify_github_yaml(root)
 
     def test_runtime_mode_restarts_and_checks_the_managed_service(self) -> None:
         module = _load_script()

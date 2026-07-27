@@ -18,6 +18,9 @@ from model_processing_engine.exceptions import (
 from .base import ProviderCallResult, ProviderConfig
 
 
+MAX_PROVIDER_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
 class OpenAICompatibleProvider:
     def __init__(
         self,
@@ -195,10 +198,14 @@ class OpenAICompatibleProvider:
                     request,
                     timeout=self.config.timeout_seconds,
                 ) as response:
-                    body = response.read().decode("utf-8")
+                    body = _read_provider_body(response, attempt=attempt)
             except urllib.error.HTTPError as exc:
                 try:
-                    body = exc.read().decode("utf-8", errors="replace")
+                    body = _read_provider_body(
+                        exc,
+                        attempt=attempt,
+                        decode_errors="replace",
+                    )
                 finally:
                     exc.close()
                 if exc.code == 429 or 500 <= exc.code < 600:
@@ -238,6 +245,29 @@ class OpenAICompatibleProvider:
             attempts=attempts,
             audit_message=f"Provider transport failed after {attempts} attempts",
         ) from last_error
+
+
+def _read_provider_body(
+    response: Any,
+    *,
+    attempt: int,
+    decode_errors: str = "strict",
+) -> str:
+    raw = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_PROVIDER_RESPONSE_BYTES:
+        raise ProviderError(
+            f"Provider response exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes",
+            attempts=attempt,
+            audit_message="Provider response exceeded the byte limit",
+        )
+    try:
+        return raw.decode("utf-8", errors=decode_errors)
+    except UnicodeDecodeError as exc:
+        raise ProviderError(
+            "Provider response is not valid UTF-8",
+            attempts=attempt,
+            audit_message="Provider response is not valid UTF-8",
+        ) from exc
 
 
 def _message_content(payload: dict[str, Any]) -> str:

@@ -46,6 +46,13 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 ```
 
+`uv.lock` records the cross-platform dependency resolution reviewed by CI. When
+`uv` is available, reproduce that environment with:
+
+```bash
+uv sync --locked --extra dev
+```
+
 For one-click local setup and managed service startup, use the platform wrapper:
 
 ```bash
@@ -293,6 +300,11 @@ waits for verified health, and rejects a conflicting listener. Stop verifies the
 application ID, runtime instance ID, and process ID before signaling a process;
 an unverified live PID is never terminated.
 
+On POSIX systems, every SDK, CLI, foreground-service, and managed-service entry
+secures the selected runtime data directory as `0700` and the SQLite database as
+`0600`. Existing wider permissions are repaired before the database is opened.
+SQLite WAL and shared-memory sidecars inherit the private database mode.
+
 `status` reports `running`, `stopped`, `stale`, `unresponsive`, `conflict`, or
 `running_unmanaged`. A foreground `serve` process is intentionally unmanaged and
 must be stopped by its owning terminal.
@@ -323,6 +335,11 @@ The default host is `127.0.0.1`. Non-loopback binding requires both
 deployments. Use a reverse proxy with TLS if the service crosses a trusted
 machine boundary.
 
+`MPE_MAX_REQUEST_BYTES` defaults to 2 MiB. MPE rejects oversized or malformed
+declared lengths before routing and also counts the actual body bytes before
+FastAPI parses the request, so omitted `Content-Length` and chunked transfer do
+not bypass the limit.
+
 Use one service process per `MPE_DATA_DIR`. Asynchronous requests are written to
 the same SQLite database before the API returns. A fixed worker pool claims work
 in FIFO order; a restart requeues work that was running and continues queued
@@ -335,8 +352,10 @@ Sensitive tasks remain synchronous because a recoverable queue must persist the
 request until it reaches a terminal state. Completed queue rows are deleted.
 Recovery is at-least-once for a request interrupted before its terminal
 execution snapshot is committed; already-terminal snapshots are not rerun.
-Separate callers may share a service, but separate service processes should use
-separate data paths.
+Separate trusted callers may share a service. MPE has one service-wide bearer
+token and does not provide caller accounts, per-caller authorization, or quotas;
+mutually untrusted callers must use isolated service instances, credentials, and
+data paths.
 
 Health includes the application version, API version, stable runtime instance
 ID, and process ID so local service management can verify process identity.
@@ -348,6 +367,11 @@ ID, and process ID so local service management can verify process identity.
 - `mock`: deterministic schema-derived output for tests and integration setup.
 - `openai_compatible`: JSON chat-completions transport with bounded retry for
   rate-limit, server, timeout, and connection failures.
+
+OpenAI-compatible response and error bodies are read with an 8 MiB hard limit.
+This bound applies to both model execution and model discovery before JSON
+decoding, preventing a misconfigured or hostile endpoint from exhausting memory
+with an unbounded response.
 
 Provider configuration may declare `availableModels`, `capabilities`, and
 `maxConcurrency`. The `/v1/providers` response exposes those non-secret
@@ -364,6 +388,12 @@ They must never be placed in Task Packs, request payloads, or committed files.
 Set a non-secret `cacheIdentity` per account/endpoint context and increment it
 when that context changes; the value participates in technical cache identity.
 
+## Security
+
+Report undisclosed vulnerabilities through the private process described in
+[SECURITY.md](SECURITY.md). Never include live credentials, real task payloads,
+or cached model results in a report.
+
 ## Verification
 
 Run the complete deterministic project verification:
@@ -376,9 +406,11 @@ Run the complete deterministic project verification:
 .venv\Scripts\python scripts\verify_project.py
 ```
 
-This runs the full unit suite, Python compilation, admin JavaScript syntax,
-`git diff --check`, and the neutral example Task Pack validation. It does not
-restart or mutate the running service.
+`uv`, Node.js, and Git must be available on `PATH`, and the project dev
+dependencies must be installed. This verifies that `uv.lock` is current, parses
+all `.github` YAML files, and runs the full unit suite, Python compilation,
+admin JavaScript syntax, `git diff --check`, and the neutral example Task Pack
+validation. It does not restart or mutate the running service.
 
 Add `--runtime` only when a managed-service restart is intended:
 

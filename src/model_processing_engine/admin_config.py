@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -165,6 +166,7 @@ class AdminConfigManager:
         self.template_path = self.project_dir / "config" / "providers.json"
         self.local_provider_path = self.project_dir / "config" / "providers.local.json"
         self._lock = threading.Lock()
+        self._verification_digest_key = secrets.token_bytes(32)
         self._verified: dict[str, tuple[str, float]] = {}
 
     def snapshot(self) -> dict[str, Any]:
@@ -290,7 +292,11 @@ class AdminConfigManager:
             digest = self._draft_digest(draft, api_key=api_key)
             self._discard_expired_tokens()
             verified = self._verified.pop(request.verification_token, None)
-            if verified is None or verified[0] != digest or verified[1] < time.monotonic():
+            if (
+                verified is None
+                or verified[1] < time.monotonic()
+                or not hmac.compare_digest(verified[0], digest)
+            ):
                 raise ConfigurationError("Provider verification expired or no longer matches")
 
             raw = self._read_provider_config()
@@ -524,12 +530,15 @@ class AdminConfigManager:
         suffix = hashlib.sha256(provider_id.encode("utf-8")).hexdigest()[:8].upper()
         return f"MPE_PROVIDER_{normalized}_{suffix}_API_KEY"
 
-    @staticmethod
-    def _draft_digest(draft: ProviderDraft, *, api_key: str) -> str:
+    def _draft_digest(self, draft: ProviderDraft, *, api_key: str) -> str:
         payload = draft.model_dump(by_alias=True, exclude={"api_key"})
         payload["apiKey"] = api_key
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        return hmac.new(
+            self._verification_digest_key,
+            serialized.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
     def _discard_expired_tokens(self) -> None:
         now = time.monotonic()

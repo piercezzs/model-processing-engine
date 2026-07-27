@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .async_queue import PersistentAsyncExecutor
 from .admin_config import (
@@ -33,6 +34,75 @@ from .exceptions import (
 )
 from .factory import build_default_engine
 from .settings import Settings, load_settings
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, *, maximum_bytes: int) -> None:
+        self.app = app
+        self.maximum_bytes = maximum_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = _declared_content_length(scope)
+        if declared is not None and (declared < 0 or declared > self.maximum_bytes):
+            await _request_too_large_response(scope, receive, send)
+            return
+
+        messages: list[Message] = []
+        received = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received += len(message.get("body", b""))
+            if received > self.maximum_bytes:
+                await _request_too_large_response(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal index
+            if index < len(messages):
+                message = messages[index]
+                index += 1
+                return message
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+
+def _declared_content_length(scope: Scope) -> int | None:
+    values = [
+        value
+        for name, value in scope.get("headers", [])
+        if name.lower() == b"content-length"
+    ]
+    if not values:
+        return None
+    if len(values) != 1:
+        return -1
+    try:
+        value = int(values[0])
+    except ValueError:
+        return -1
+    return value if value >= 0 else -1
+
+
+async def _request_too_large_response(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+) -> None:
+    response = Response(status_code=413, content="Request body too large")
+    await response(scope, receive, send)
 
 
 def create_app(
@@ -64,22 +134,14 @@ def create_app(
         description="Business-neutral runtime for externally defined model tasks.",
         lifespan=lifespan,
     )
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        maximum_bytes=runtime.max_request_bytes,
+    )
     admin_manager = AdminConfigManager(runtime.project_dir) if runtime.project_dir else None
     admin_csrf_token = secrets.token_urlsafe(32)
     restart_service_later = restart_scheduler or schedule_managed_restart
     admin_assets = Path(__file__).with_name("admin_ui")
-
-    @app.middleware("http")
-    async def enforce_request_size(request: Request, call_next: Any) -> Response:
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                declared = int(content_length)
-            except ValueError:
-                declared = runtime.max_request_bytes + 1
-            if declared > runtime.max_request_bytes:
-                return Response(status_code=413, content="Request body too large")
-        return await call_next(request)
 
     @app.middleware("http")
     async def enforce_api_token(request: Request, call_next: Any) -> Response:

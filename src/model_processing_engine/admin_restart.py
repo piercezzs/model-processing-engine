@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .file_store import ensure_private_directory, ensure_private_file
 from .process_manager import restart_service
 from .settings import Settings, load_settings
 
@@ -22,7 +23,8 @@ def schedule_managed_restart(settings: Settings) -> None:
     environment = dict(os.environ)
     if settings.project_dir:
         environment["MPE_PROJECT_DIR"] = str(settings.project_dir)
-    settings.service_log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_directory(settings.service_log_path.parent)
+    ensure_private_file(settings.service_log_path)
     descriptor = os.open(
         settings.service_log_path,
         os.O_WRONLY | os.O_CREAT | os.O_APPEND,

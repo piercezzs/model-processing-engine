@@ -6,13 +6,15 @@ from pathlib import Path
 from typing import BinaryIO, Iterator
 
 from .exceptions import ServiceManagerError
+from .file_store import ensure_private_directory, ensure_private_file
 from .settings import Settings
 
 
 @contextmanager
 def exclusive_runtime_lock(settings: Settings) -> Iterator[None]:
-    settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_directory(settings.data_dir)
     path = settings.data_dir / "service.lock"
+    ensure_private_file(path)
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     stream = os.fdopen(descriptor, "r+b", buffering=0)
     locked = False

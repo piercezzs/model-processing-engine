@@ -39,6 +39,12 @@ input identity. Namespaces never share entries.
 Cached model output is disposable computation reuse. Durable business results
 remain owned and stored by the caller.
 
+The store owns its filesystem privacy invariant. Before SQLite is opened, every
+entry path secures the selected data directory and database file; POSIX
+deployments use `0700` for the directory and `0600` for the database and
+sidecars. Keeping this invariant in the storage layer prevents SDK and one-shot
+CLI construction from bypassing service-manager preparation.
+
 Provider prompt caching is a separate upstream optimization. The engine places
 the stable task output schema and optional taxonomy before caller-specific input
 in the serialized Provider payload so prefix-based caches can reuse the largest
@@ -100,6 +106,18 @@ explicit remote opt-in and an API token supplied through the environment.
 Provider secrets are also environment-only. Task schemas may use internal JSON
 Schema fragments, but external references are rejected to prevent validation
 from retrieving untrusted resources.
+
+The HTTP boundary rejects malformed or oversized declared request lengths and
+also counts the actual ASGI request body before framework parsing. Provider
+transport independently bounds successful and error response bodies before JSON
+decoding. These limits constrain memory use on both sides of the execution
+contract.
+
+Remote authentication represents the service as a whole. It does not create
+caller principals, bind namespaces to identities, enforce per-caller quotas, or
+authorize access to individual execution records. Sharing is therefore limited
+to trusted callers; mutually untrusted callers require separate service
+instances, credentials, and data directories.
 
 ## Managed Service Lifecycle
 

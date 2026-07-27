@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from model_processing_engine.cache import SQLiteRuntimeStore
-from model_processing_engine.exceptions import AsyncQueueFullError
+from model_processing_engine.exceptions import AsyncQueueFullError, ConfigurationError
 
 
 class CacheStoreTests(unittest.TestCase):
@@ -48,6 +50,65 @@ class CacheStoreTests(unittest.TestCase):
             record = second.get_cache("one", "key")
             self.assertIsNotNone(record)
             self.assertEqual(record.result, {"summary": "saved"})
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not a Windows security boundary")
+    def test_store_secures_direct_sdk_directory_database_and_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "sdk" / "runtime" / "runtime.sqlite"
+            previous_umask = os.umask(0o022)
+            try:
+                store = SQLiteRuntimeStore(path)
+                with store._connect() as connection:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO cache_entries "
+                        "(namespace, cache_key, task_id, task_version, provider_id, model, "
+                        "result_json, metadata_json, created_at, expires_at, "
+                        "last_accessed_at, hit_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            "one",
+                            "key",
+                            "task",
+                            "1",
+                            "mock",
+                            "mock-v1",
+                            "{}",
+                            "{}",
+                            0.0,
+                            None,
+                            0.0,
+                            0,
+                        ),
+                    )
+                    modes = {
+                        candidate.name: stat.S_IMODE(candidate.stat().st_mode)
+                        for candidate in (
+                            path,
+                            Path(f"{path}-wal"),
+                            Path(f"{path}-shm"),
+                        )
+                        if candidate.exists()
+                    }
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+            self.assertEqual(modes["runtime.sqlite"], 0o600)
+            self.assertEqual(modes["runtime.sqlite-wal"], 0o600)
+            self.assertEqual(modes["runtime.sqlite-shm"], 0o600)
+
+    def test_store_rejects_symbolic_link_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target.sqlite"
+            target.touch()
+            link = root / "runtime.sqlite"
+            try:
+                link.symlink_to(target)
+            except (NotImplementedError, OSError):
+                self.skipTest("Symbolic links are not available")
+            with self.assertRaises(ConfigurationError):
+                SQLiteRuntimeStore(link)
 
     def test_namespaces_are_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -300,6 +300,24 @@ class AdminConfigManagerTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 manager.apply_provider(changed)
 
+    def test_verification_digest_is_keyed_per_manager_process(self) -> None:
+        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
+            draft = ProviderDraft.model_validate(
+                {
+                    "providerId": "private-model",
+                    "type": "openai_compatible",
+                    "baseUrl": "https://models.example/v1",
+                    "model": "model-one",
+                }
+            )
+            first = AdminConfigManager(self._project(Path(first_dir)))
+            second = AdminConfigManager(self._project(Path(second_dir)))
+
+            first_digest = first._draft_digest(draft, api_key="same-secret")
+            second_digest = second._draft_digest(draft, api_key="same-secret")
+
+            self.assertNotEqual(first_digest, second_digest)
+
     def test_openai_provider_rejects_unsafe_or_non_http_base_urls(self) -> None:
         rejected = (
             "models.example/v1",

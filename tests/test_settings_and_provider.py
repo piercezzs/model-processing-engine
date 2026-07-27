@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from model_processing_engine.exceptions import ConfigurationError, ProviderEmptyContentError
+from model_processing_engine.exceptions import (
+    ConfigurationError,
+    ProviderEmptyContentError,
+    ProviderError,
+)
 from model_processing_engine.providers.base import ProviderConfig, ProviderRegistry
 from model_processing_engine.providers.openai_compatible import OpenAICompatibleProvider
 from model_processing_engine.settings import PACKAGE_PROVIDER_CONFIG, load_settings
@@ -16,6 +22,7 @@ from model_processing_engine.settings import PACKAGE_PROVIDER_CONFIG, load_setti
 class _Response:
     def __init__(self, payload: dict[str, object]) -> None:
         self._body = json.dumps(payload).encode("utf-8")
+        self.read_sizes: list[int] = []
 
     def __enter__(self) -> "_Response":
         return self
@@ -23,8 +30,9 @@ class _Response:
     def __exit__(self, *_args: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return self._body if size < 0 else self._body[:size]
 
 
 class SettingsAndProviderTests(unittest.TestCase):
@@ -130,6 +138,89 @@ class SettingsAndProviderTests(unittest.TestCase):
             list(serialized_model_payload),
             ["outputSchema", "taxonomy", "input"],
         )
+
+    def test_openai_compatible_provider_bounds_success_response_bytes(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+                transport_retries=0,
+            )
+        )
+        response = _Response(
+            {"choices": [{"message": {"content": "x" * 256}}]}
+        )
+        with (
+            patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True),
+            patch(
+                "model_processing_engine.providers.openai_compatible."
+                "MAX_PROVIDER_RESPONSE_BYTES",
+                64,
+            ),
+            patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ),
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload={},
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=32,
+                )
+
+        self.assertIn("exceeded 64 bytes", str(raised.exception))
+        self.assertEqual(raised.exception.attempts, 1)
+        self.assertEqual(response.read_sizes, [65])
+
+    def test_openai_compatible_provider_bounds_http_error_response_bytes(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+                transport_retries=0,
+            )
+        )
+        response_error = urllib.error.HTTPError(
+            "https://example.invalid/v1/chat/completions",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b"x" * 256),
+        )
+        with (
+            patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True),
+            patch(
+                "model_processing_engine.providers.openai_compatible."
+                "MAX_PROVIDER_RESPONSE_BYTES",
+                64,
+            ),
+            patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                side_effect=response_error,
+            ),
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload={},
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=32,
+                )
+
+        self.assertIn("exceeded 64 bytes", str(raised.exception))
+        self.assertEqual(raised.exception.attempts, 1)
 
     def test_openai_compatible_provider_parses_deepseek_prompt_cache_usage(self) -> None:
         provider = OpenAICompatibleProvider(

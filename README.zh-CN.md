@@ -43,6 +43,13 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 ```
 
+`uv.lock` 记录由 CI 审核的跨平台依赖解析结果。系统已安装 `uv` 时，可通过以下
+命令复现该环境：
+
+```bash
+uv sync --locked --extra dev
+```
+
 如需一键完成本地配置并启动托管服务，请使用对应平台的启动脚本：
 
 ```bash
@@ -270,6 +277,10 @@ result = build_default_engine(root=root).execute(request)
 响应，并拒绝存在冲突的监听器。停止服务前会验证应用 ID、运行时实例 ID 和进程
 ID；无法验证的活动 PID 永远不会被终止。
 
+在 POSIX 系统上，SDK、CLI、前台服务和托管服务的所有入口都会在打开数据库前，
+把选定的运行时数据目录设为 `0700`、SQLite 数据库设为 `0600`，并修复已有的
+宽松权限。SQLite WAL 和共享内存旁路文件会继承数据库的私有权限。
+
 `status` 可能返回 `running`、`stopped`、`stale`、`unresponsive`、
 `conflict` 或 `running_unmanaged`。前台 `serve` 进程不会被托管，必须由启动
 它的终端负责停止。
@@ -298,6 +309,10 @@ HTTP 请求包含解析后的 `TaskDefinition` 和输入数据，不包含服务
 `Authorization: Bearer <token>`。只有回环部署的健康检查保持公开。如果服务跨越
 可信计算机边界，请使用提供 TLS 的反向代理。
 
+`MPE_MAX_REQUEST_BYTES` 默认值为 2 MiB。MPE 会在路由前拒绝超限或格式错误的
+声明长度，并在 FastAPI 解析请求前按实际收到的字节计数，因此省略
+`Content-Length` 或使用 chunked 传输都不能绕过限制。
+
 每个 `MPE_DATA_DIR` 只能由一个服务进程持有。异步请求会在 API 返回前写入同一个
 SQLite 数据库。固定 Worker 池按照 FIFO 顺序领取任务；服务重启后，会重新排队
 之前正在运行的任务，并继续处理已排队请求。没有持久请求载荷的旧记录或不完整记录
@@ -307,8 +322,9 @@ SQLite 数据库。固定 Worker 池按照 FIFO 顺序领取任务；服务重�
 
 敏感任务保持同步执行，因为可恢复队列在任务到达终态前必须持久化完整请求。任务
 完成后会删除对应队列行。对于终态快照提交前被中断的请求，恢复语义为
-at-least-once；已经存在终态快照的任务不会再次执行。多个调用方可以共享同一服务，
-但不同服务进程应使用不同的数据路径。
+at-least-once；已经存在终态快照的任务不会再次执行。多个可信调用方可以共享同一
+服务。MPE 只有一个服务级 Bearer Token，不提供调用方账号、逐调用方授权或配额；
+互不信任的调用方必须使用彼此隔离的服务实例、凭证和数据路径。
 
 健康检查会返回应用版本、API 版本、稳定的运行时实例 ID 和进程 ID，供本地服务
 管理器验证进程身份。
@@ -320,6 +336,10 @@ at-least-once；已经存在终态快照的任务不会再次执行。多个调�
 - `mock`：根据 Schema 生成确定性结果，用于测试和集成配置。
 - `openai_compatible`：使用 JSON Chat Completions 传输，并对限流、服务器错误、
   超时和连接失败执行有限次数的重试。
+
+OpenAI-compatible 的正常响应体和错误响应体均使用 8 MiB 硬上限读取。模型执行和
+模型发现都会在 JSON 解码前应用该限制，避免配置错误或恶意端点通过无界响应耗尽
+内存。
 
 Provider 配置可以声明 `availableModels`、`capabilities` 和 `maxConcurrency`。
 `/v1/providers` 响应会公开这些非秘密声明，同时保留原有 Provider ID 列表以保持
@@ -333,6 +353,11 @@ Provider 配置通过环境变量名引用凭证。不得将凭证写入 Task Pa
 提交文件。为每个账号/端点上下文设置一个非秘密 `cacheIdentity`；上下文改变时应
 递增该值，因为它会参与技术缓存身份计算。
 
+## 安全
+
+未公开的漏洞请按照 [SECURITY.md](SECURITY.md) 中的私密流程报告。报告中不得包含
+有效凭证、真实任务载荷或缓存的模型结果。
+
 ## 验证
 
 运行完整的确定性项目验证：
@@ -345,8 +370,10 @@ Provider 配置通过环境变量名引用凭证。不得将凭证写入 Task Pa
 .venv\Scripts\python scripts\verify_project.py
 ```
 
-该脚本会运行完整单元测试、Python 编译、管理端 JavaScript 语法检查、
-`git diff --check` 和中立示例 Task Pack 校验，不会重启或修改正在运行的服务。
+执行前需要确保 `uv`、Node.js 和 Git 可从 `PATH` 访问，并已安装项目开发依赖。
+该脚本会检查 `uv.lock` 是否为最新状态、解析全部 `.github` YAML 文件，并运行完整
+单元测试、Python 编译、管理端 JavaScript 语法检查、`git diff --check` 和中立
+示例 Task Pack 校验；不会重启或修改正在运行的服务。
 
 只有在确定需要重启托管服务时，才添加 `--runtime`：
 

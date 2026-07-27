@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import tempfile
 import time
@@ -19,6 +20,47 @@ from tests.helpers import engine_with_mock, execution_request, task_definition
 
 
 class ServiceAndCliTests(unittest.TestCase):
+    def test_request_size_limit_rejects_declared_and_chunked_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(root)
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="127.0.0.1",
+                port=8787,
+                allow_remote=False,
+                max_provider_concurrency=8,
+                max_request_bytes=1024,
+            )
+            payload = execution_request(
+                task_definition(),
+                input_payload={"text": "x" * 2048},
+            ).model_dump(by_alias=True)
+            body = json.dumps(payload).encode("utf-8")
+
+            with TestClient(create_app(engine=engine, settings=settings)) as client:
+                declared = client.post(
+                    "/v1/executions",
+                    content=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                chunked_request = client.build_request(
+                    "POST",
+                    "/v1/executions",
+                    content=iter([body[:700], body[700:]]),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Transfer-Encoding": "chunked",
+                    },
+                )
+                chunked = client.send(chunked_request)
+
+            self.assertGreater(len(body), settings.max_request_bytes)
+            self.assertEqual(declared.status_code, 413)
+            self.assertEqual(chunked.status_code, 413)
+
     def test_sync_and_async_execution_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

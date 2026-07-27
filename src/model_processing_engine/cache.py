@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import AsyncQueueFullError
+from .file_store import ensure_private_file
 
 
 @dataclass(frozen=True)
@@ -26,8 +27,8 @@ class CacheRecord:
 
 class SQLiteRuntimeStore:
     def __init__(self, path: str | Path) -> None:
-        self.path = Path(path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = Path(path).expanduser().absolute()
+        ensure_private_file(self.path)
         self._initialize()
 
     @contextmanager

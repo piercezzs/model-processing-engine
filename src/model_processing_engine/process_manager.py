@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from .constants import API_VERSION, APP_ID
 from .exceptions import ServiceManagerError
+from .file_store import ensure_private_directory, ensure_private_file
 from .settings import Settings
 
 
@@ -412,17 +413,17 @@ def _kill_verified_process(pid: int) -> None:
 
 
 def _prepare_runtime_directories(settings: Settings) -> None:
+    settings.root.mkdir(parents=True, exist_ok=True)
     for path in (
-        settings.root,
         settings.data_dir,
         settings.service_log_path.parent,
         settings.service_record_path.parent,
     ):
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_private_directory(path)
 
 
 def _open_service_log(path: Path) -> BinaryIO:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_private_file(path)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     return os.fdopen(descriptor, "ab", buffering=0)
 
