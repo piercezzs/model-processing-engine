@@ -182,8 +182,8 @@ class ProcessManagerTests(unittest.TestCase):
                 _health(settings, service_pid),
             ]
             with patch(
-                "model_processing_engine.process_manager.os.name",
-                "nt",
+                "model_processing_engine.process_manager._is_windows",
+                return_value=True,
             ), patch(
                 "model_processing_engine.process_manager._probe_health",
                 side_effect=probes,
@@ -221,22 +221,26 @@ class ProcessManagerTests(unittest.TestCase):
                     start_service(settings, timeout_seconds=1)
             self.assertFalse(settings.service_record_path.exists())
 
-    def test_windows_invalid_pid_is_treated_as_not_running(self) -> None:
+    def test_os_kill_errors_are_treated_as_not_running(self) -> None:
         with patch(
-            "model_processing_engine.process_manager.os.kill",
-            side_effect=OSError(87, "The parameter is incorrect"),
+            "model_processing_engine.process_manager._is_windows",
+            return_value=False,
         ):
-            self.assertFalse(process_manager._process_exists(43210))
-        with patch(
-            "model_processing_engine.process_manager.os.kill",
-            side_effect=SystemError("kill returned a result with an exception set"),
-        ):
-            self.assertFalse(process_manager._process_exists(43210))
+            with patch(
+                "model_processing_engine.process_manager.os.kill",
+                side_effect=OSError(87, "The parameter is incorrect"),
+            ):
+                self.assertFalse(process_manager._process_exists(43210))
+            with patch(
+                "model_processing_engine.process_manager.os.kill",
+                side_effect=SystemError("kill returned a result with an exception set"),
+            ):
+                self.assertFalse(process_manager._process_exists(43210))
 
     def test_windows_process_existence_uses_native_query(self) -> None:
         with patch(
-            "model_processing_engine.process_manager.os.name",
-            "nt",
+            "model_processing_engine.process_manager._is_windows",
+            return_value=True,
         ), patch(
             "model_processing_engine.process_manager._windows_process_exists",
             return_value=True,

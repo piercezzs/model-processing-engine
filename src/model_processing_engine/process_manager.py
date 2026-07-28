@@ -27,6 +27,10 @@ DEFAULT_CONTROL_TIMEOUT_SECONDS = 15.0
 LOCK_STALE_SECONDS = 60.0
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 @dataclass(frozen=True)
 class ServiceRecord:
     pid: int
@@ -220,7 +224,7 @@ def _start_locked(settings: Settings, *, timeout_seconds: float) -> dict[str, ob
             return service_status(settings)
         health_pid = _health_pid(probe.payload)
         if (
-            os.name == "nt"
+            _is_windows()
             and health_pid is not None
             and _health_matches(settings, probe.payload)
             and process.poll() is None
@@ -375,7 +379,7 @@ def _port_is_open(settings: Settings) -> bool:
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
-    if os.name == "nt":
+    if _is_windows():
         return _windows_process_exists(pid)
     try:
         os.kill(pid, 0)
@@ -384,8 +388,8 @@ def _process_exists(pid: int) -> bool:
     except PermissionError:
         return True
     except (OSError, SystemError):
-        # Windows may report an exited or otherwise invalid PID as WinError 87,
-        # and some Python builds surface that failure as SystemError.
+        # Some Python/platform combinations surface an invalid or exited PID
+        # through these broader low-level errors.
         return False
     return True
 
@@ -426,7 +430,7 @@ def _spawn_service(settings: Settings, log_stream: BinaryIO) -> subprocess.Popen
         "env": environment,
         "close_fds": True,
     }
-    if os.name == "nt":
+    if _is_windows():
         return subprocess.Popen(
             command,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
