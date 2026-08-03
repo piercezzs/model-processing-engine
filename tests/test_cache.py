@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -354,43 +355,44 @@ class CacheStoreTests(unittest.TestCase):
                 "provider": {"id": "legacy-provider", "model": "legacy-model"},
                 "timing": {"createdAt": "2026-07-23T01:00:00+00:00"},
             }
-            with sqlite3.connect(path) as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE execution_records (
-                        execution_id TEXT PRIMARY KEY,
-                        status TEXT NOT NULL,
-                        namespace TEXT NOT NULL,
-                        task_id TEXT NOT NULL,
-                        task_version TEXT NOT NULL,
-                        envelope_json TEXT NOT NULL,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL
+            with closing(sqlite3.connect(path)) as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        CREATE TABLE execution_records (
+                            execution_id TEXT PRIMARY KEY,
+                            status TEXT NOT NULL,
+                            namespace TEXT NOT NULL,
+                            task_id TEXT NOT NULL,
+                            task_version TEXT NOT NULL,
+                            envelope_json TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            updated_at REAL NOT NULL
+                        )
+                        """
                     )
-                    """
-                )
-                connection.execute(
-                    """
-                    INSERT INTO execution_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        "legacy",
-                        "succeeded",
-                        "legacy-project",
-                        "legacy-task",
-                        "1",
-                        json.dumps(envelope),
-                        1784768400.0,
-                        1784768400.0,
-                    ),
-                )
+                    connection.execute(
+                        """
+                        INSERT INTO execution_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "legacy",
+                            "succeeded",
+                            "legacy-project",
+                            "legacy-task",
+                            "1",
+                            json.dumps(envelope),
+                            1784768400.0,
+                            1784768400.0,
+                        ),
+                    )
 
             store = SQLiteRuntimeStore(path)
             history = store.execution_history(kind="provider_test")
 
             self.assertEqual(history["pagination"]["total"], 1)
             self.assertEqual(history["items"][0]["provider"]["id"], "legacy-provider")
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection:
                 row = connection.execute(
                     """
                     SELECT kind, provider_id, model

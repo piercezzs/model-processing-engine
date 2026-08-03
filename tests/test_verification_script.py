@@ -45,12 +45,23 @@ class VerificationScriptContractTests(unittest.TestCase):
         )
         self.assertTrue(any("unittest discover" in command for command in commands))
         self.assertTrue(any("compileall" in command for command in commands))
-        self.assertTrue(any("uv lock --check" in command for command in commands))
         self.assertTrue(any("--check-github-yaml" in command for command in commands))
-        self.assertTrue(any("node --check" in command for command in commands))
-        self.assertTrue(any("git diff --check" in command for command in commands))
         self.assertTrue(any("task validate" in command for command in commands))
         self.assertEqual(steps[0].command[0], sys.executable)
+
+        commands_by_label = {step.label: step.command for step in steps}
+        for label, executable, arguments in (
+            ("Locked dependency resolution", "uv", ("lock", "--check")),
+            (
+                "Admin JavaScript syntax",
+                "node",
+                ("--check", "src/model_processing_engine/admin_ui/app.js"),
+            ),
+            ("Git whitespace and conflict markers", "git", ("diff", "--check")),
+        ):
+            command = commands_by_label[label]
+            self.assertEqual(Path(command[0]).stem.casefold(), executable)
+            self.assertEqual(command[1:], arguments)
 
     def test_github_yaml_parser_accepts_mappings_and_rejects_malformed_yaml(self) -> None:
         module = _load_script()
