@@ -223,6 +223,7 @@ function historyStatusLabel(status) {
     running: "执行中",
     succeeded: "成功",
     failed: "失败",
+    cancelled: "已取消",
   }[status] || status || "未知";
 }
 
@@ -404,7 +405,8 @@ function renderHistoryStatistics(payload) {
     `${formatNumber(summary.contractRepairs)} 次合同修复 · ` +
     `${formatNumber(summary.transportRetries)} 次重试`;
   elements.historyStatusSummary.textContent =
-    `${formatNumber(summary.succeeded)} 成功 · ${formatNumber(summary.failed)} 失败` +
+    `${formatNumber(summary.succeeded)} 成功 · ${formatNumber(summary.failed)} 失败 · ` +
+    `${formatNumber(summary.cancelled)} 取消` +
     (summary.averageElapsedMs
       ? ` · 平均 ${formatDuration(summary.averageElapsedMs)}`
       : "");

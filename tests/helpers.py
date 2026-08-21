@@ -18,6 +18,7 @@ def task_definition(
     prompt: str = "Return JSON.",
     cache_policy: dict[str, Any] | None = None,
     batch_policy: dict[str, Any] | None = None,
+    stream_policy: dict[str, Any] | None = None,
     input_schema: dict[str, Any] | None = None,
     output_schema: dict[str, Any] | None = None,
 ) -> TaskDefinition:
@@ -44,6 +45,7 @@ def task_definition(
             },
             "cachePolicy": cache_policy or {"mode": "exact"},
             "batchPolicy": batch_policy or {"enabled": False},
+            "streamPolicy": stream_policy or {"mode": "disabled"},
             "runtimeDefaults": {
                 "providerId": "mock",
                 "model": "mock-v1",
@@ -73,6 +75,8 @@ def engine_with_mock(
     root: Path,
     *,
     responder: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    text_responder: Callable[[dict[str, Any], str | None], str] | None = None,
+    text_chunk_size: int = 3,
     delay_seconds: float = 0,
     provider_max_concurrency: int = 8,
     service_max_concurrency: int = 64,
@@ -82,8 +86,15 @@ def engine_with_mock(
         type="mock",
         default_model="mock-v1",
         max_concurrency=provider_max_concurrency,
+        capabilities=("structured_json", "text_stream"),
     )
-    provider = MockProvider(config, responder=responder, delay_seconds=delay_seconds)
+    provider = MockProvider(
+        config,
+        responder=responder,
+        text_responder=text_responder,
+        text_chunk_size=text_chunk_size,
+        delay_seconds=delay_seconds,
+    )
     registry = ProviderRegistry({"mock": provider}, default_provider_id="mock")
     engine = ModelProcessingEngine(
         providers=registry,

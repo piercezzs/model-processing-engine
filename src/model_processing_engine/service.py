@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import json
 import os
 import secrets
 import uuid
@@ -12,7 +13,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .async_queue import PersistentAsyncExecutor
@@ -29,6 +30,7 @@ from .engine import ModelProcessingEngine
 from .exceptions import (
     AsyncQueueFullError,
     ConfigurationError,
+    ContractValidationError,
     ExecutionNotFoundError,
     ProviderError,
 )
@@ -74,7 +76,7 @@ class RequestBodyLimitMiddleware:
                 message = messages[index]
                 index += 1
                 return message
-            return {"type": "http.request", "body": b"", "more_body": False}
+            return await receive()
 
         await self.app(scope, replay_receive, send)
 
@@ -263,7 +265,10 @@ def create_app(
         offset: int = Query(default=0, ge=0),
         namespace: str | None = Query(default=None, max_length=256),
         task_id: str | None = Query(default=None, alias="taskId", max_length=256),
-        status: str | None = Query(default=None, pattern="^(queued|running|succeeded|failed)$"),
+        status: str | None = Query(
+            default=None,
+            pattern="^(queued|running|succeeded|failed|cancelled)$",
+        ),
         kind: str | None = Query(default=None, pattern="^(task|provider_test)$"),
         provider_id: str | None = Query(
             default=None,
@@ -299,7 +304,10 @@ def create_app(
         ),
         namespace: str | None = Query(default=None, max_length=256),
         task_id: str | None = Query(default=None, alias="taskId", max_length=256),
-        status: str | None = Query(default=None, pattern="^(queued|running|succeeded|failed)$"),
+        status: str | None = Query(
+            default=None,
+            pattern="^(queued|running|succeeded|failed|cancelled)$",
+        ),
         kind: str = Query(default="task", pattern="^(task|provider_test|all)$"),
         provider_id: str | None = Query(
             default=None,
@@ -374,6 +382,34 @@ def create_app(
         except AsyncQueueFullError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return reserved.model_dump(by_alias=True)
+
+    @app.post(f"/{API_VERSION}/executions/stream")
+    def execute_stream(request: ExecutionRequest) -> StreamingResponse:
+        try:
+            task_engine.validate_stream_request(request)
+        except (ConfigurationError, ContractValidationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        def stream_events() -> Any:
+            for stream_event in task_engine.execute_stream(request):
+                payload = stream_event.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                yield (
+                    f"id: {stream_event.sequence}\n"
+                    f"event: {stream_event.event}\n"
+                    f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                )
+
+        return StreamingResponse(
+            stream_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get(f"/{API_VERSION}/executions/{{execution_id}}")
     def execution(execution_id: str) -> dict[str, Any]:

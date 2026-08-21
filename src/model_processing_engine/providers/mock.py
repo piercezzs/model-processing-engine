@@ -3,12 +3,20 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from .base import ProviderCallResult, ProviderConfig
+from .base import (
+    ProviderCallResult,
+    ProviderConfig,
+    ProviderTextCompleted,
+    ProviderTextDelta,
+    ProviderTextEvent,
+    ProviderTextResult,
+)
 
 
 MockResponder = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+MockTextResponder = Callable[[dict[str, Any], str | None], str]
 
 
 class MockProvider:
@@ -17,10 +25,14 @@ class MockProvider:
         config: ProviderConfig,
         *,
         responder: MockResponder | None = None,
+        text_responder: MockTextResponder | None = None,
+        text_chunk_size: int = 3,
         delay_seconds: float = 0,
     ) -> None:
         self.config = config
         self._responder = responder
+        self._text_responder = text_responder
+        self._text_chunk_size = max(1, text_chunk_size)
         self._delay_seconds = max(0, delay_seconds)
         self._lock = threading.Lock()
         self.call_count = 0
@@ -58,6 +70,46 @@ class MockProvider:
             },
             attempts=1,
             elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+        )
+
+    def stream_text(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        input_payload: dict[str, Any],
+        temperature: float,
+        max_tokens: int | None,
+        repair_feedback: str | None = None,
+        previous_output: str | None = None,
+    ) -> Iterator[ProviderTextEvent]:
+        del model, system_prompt, temperature, max_tokens
+        started = time.perf_counter()
+        with self._lock:
+            self.call_count += 1
+        if self._delay_seconds:
+            time.sleep(self._delay_seconds)
+        text = (
+            self._text_responder(copy.deepcopy(input_payload), repair_feedback)
+            if self._text_responder
+            else "sample"
+        )
+        del previous_output
+        for index in range(0, len(text), self._text_chunk_size):
+            yield ProviderTextDelta(text[index : index + self._text_chunk_size])
+        yield ProviderTextCompleted(
+            ProviderTextResult(
+                text=text,
+                usage={
+                    "available": False,
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                    "source": "mock_provider",
+                },
+                attempts=1,
+                elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            )
         )
 
 

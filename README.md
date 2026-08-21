@@ -72,11 +72,25 @@ so unchanged environments can be reused without reinstalling. If an existing
 environment without an unnecessary networked install. It delegates
 service identity and port-conflict handling to MPE's verified process manager
 and never terminates a process merely because port `8787` is occupied.
+Each normal wrapper invocation uses the verified `restart` operation: it starts
+a stopped managed service, or replaces an already-running verified managed
+instance so current source and Provider configuration are loaded. The lower-level
+`mpe start` CLI command remains idempotent for callers that explicitly need that
+behavior.
+
+Automation and local control planes can keep the same environment-repair path
+without replacing a healthy instance by passing `--start-only --no-open`. This
+mode prepares the environment and delegates to the idempotent `mpe start`
+operation; the normal no-flag wrapper continues to refresh the managed service.
 
 Run the non-starting readiness check after setup with
 `./start_mpe.command --check-only` on macOS or `start_mpe.bat --check-only` on
 Windows. Stop the verified managed service with `./stop_mpe.command` or
 `stop_mpe.bat`.
+
+Local control planes that already trust the prepared repository environment can
+use `--status-only` for a lightweight, read-only JSON service status without
+repeating dependency validation.
 
 Normal one-click startup opens the loopback management page at `/admin` after
 verified health. Use `--no-open` to start without opening a browser. The
@@ -222,6 +236,30 @@ Sensitive tasks must execute synchronously. Their result is returned to that
 caller but omitted from persistent execution records as well as the result
 cache.
 
+### Plain-text streaming tasks
+
+Set `streamPolicy.mode` to `text_field` when a caller needs visible incremental
+assistant text:
+
+```json
+{
+  "streamPolicy": {"mode": "text_field", "resultField": "reply"},
+  "cachePolicy": {"mode": "disabled", "sensitive": true}
+}
+```
+
+The output schema must be an object whose only required property is the string
+named by `resultField`. Streaming tasks cannot use batching, asynchronous queue
+mode, or MPE result caching. The Provider emits plain-text deltas; MPE aggregates
+them into `{resultField: fullText}` and applies the normal output-schema
+validation before emitting a canonical completion envelope.
+
+If contract repair is needed, the stream emits `content.reset` before the next
+attempt. Callers must discard the tentative text from the previous attempt.
+Only `execution.completed` is a durable successful result; a disconnected
+consumer is recorded as `cancelled` and partial text is never persisted as the
+result.
+
 Task files cannot escape their directory. Input and output schemas support local
 JSON Schema fragments such as `#/$defs/Item`; external `$ref` values are rejected
 so validation cannot fetch untrusted resources.
@@ -317,6 +355,7 @@ Available routes:
 - `GET /v1/health`
 - `GET /v1/providers`
 - `POST /v1/executions`
+- `POST /v1/executions/stream` (SSE for `text_field` tasks)
 - `GET /v1/executions/{execution_id}`
 - `POST /v1/cache/cleanup`
 - `GET /admin` (loopback management page)
@@ -331,6 +370,14 @@ HTTP requests contain the resolved `TaskDefinition` and input data, never a
 server-side task directory path. This keeps filesystem ownership with the
 calling project. Set `asyncMode` to true to receive a queued envelope and poll
 the execution route.
+
+`POST /v1/executions/stream` returns `text/event-stream`. Events are ordered by
+their monotonically increasing `sequence` and use these names:
+`execution.started`, `attempt.started`, `content.delta`, `content.reset`,
+`validation.started`, `execution.completed`, and `execution.failed`. The final
+two events carry a complete `ResultEnvelope`; cancellation caused by client
+disconnect is retained in execution history because there is no connected
+consumer to receive an `execution.cancelled` event.
 
 The default host is `127.0.0.1`. Non-loopback binding requires both
 `MPE_ALLOW_REMOTE=1` and `MPE_API_TOKEN`; authenticated routes then require
@@ -368,8 +415,8 @@ ID, and process ID so local service management can verify process identity.
 `config/providers.json` shows the supported provider types:
 
 - `mock`: deterministic schema-derived output for tests and integration setup.
-- `openai_compatible`: JSON chat-completions transport with bounded retry for
-  rate-limit, server, timeout, and connection failures.
+- `openai_compatible`: JSON and plain-text SSE chat-completions transport with
+  bounded retry for rate-limit, server, timeout, and connection failures.
 
 OpenAI-compatible response and error bodies are read with an 8 MiB hard limit.
 This bound applies to both model execution and model discovery before JSON
@@ -382,6 +429,9 @@ declarations while preserving the original provider-ID list for compatibility.
 `structured_json` uses JSON-object mode. `native_json_schema` sends the task
 output schema through the Provider's strict JSON Schema request field and must
 only be declared for known-compatible platform/model combinations.
+`text_stream` enables plain-text SSE calls. A stream is retried only before the
+first content delta; once content has been exposed, transport failure is
+terminal so callers never receive silently duplicated text.
 `maxConcurrency` is enforced independently for each Provider across all callers.
 The environment-level `MPE_MAX_PROVIDER_CONCURRENCY` remains a service-wide
 safety ceiling; the effective Provider limit is the smaller of the two.

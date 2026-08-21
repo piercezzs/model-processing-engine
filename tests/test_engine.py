@@ -19,6 +19,112 @@ def summary_responder(payload, _schema):
 
 
 class EngineTests(unittest.TestCase):
+    @staticmethod
+    def _stream_task(*, minimum_length: int = 1, sensitive: bool = False):
+        return task_definition(
+            cache_policy={"mode": "disabled", "sensitive": sensitive},
+            stream_policy={"mode": "text_field", "resultField": "reply"},
+            output_schema={
+                "type": "object",
+                "required": ["reply"],
+                "properties": {
+                    "reply": {"type": "string", "minLength": minimum_length}
+                },
+                "additionalProperties": False,
+            },
+        )
+
+    def test_text_stream_emits_deltas_and_canonical_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(
+                Path(temp_dir),
+                text_responder=lambda payload, _feedback: payload["input"]["text"],
+                text_chunk_size=2,
+            )
+            request = execution_request(
+                self._stream_task(sensitive=True),
+                {"text": "hello"},
+            )
+            events = list(engine.execute_stream(request))
+
+            self.assertEqual(
+                [item.event for item in events],
+                [
+                    "execution.started",
+                    "attempt.started",
+                    "content.delta",
+                    "content.delta",
+                    "content.delta",
+                    "validation.started",
+                    "execution.completed",
+                ],
+            )
+            self.assertEqual(
+                "".join(item.delta or "" for item in events),
+                "hello",
+            )
+            completed = events[-1].envelope
+            self.assertIsNotNone(completed)
+            assert completed is not None
+            self.assertEqual(completed.result, {"reply": "hello"})
+            persisted = engine.get_execution(completed.execution_id)
+            self.assertEqual(persisted.status, "succeeded")
+            self.assertIsNone(persisted.result)
+            self.assertEqual(provider.call_count, 1)
+
+    def test_text_stream_resets_before_contract_repair(self) -> None:
+        def responder(_payload, feedback):
+            return "x" if feedback is None else "fixed"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(
+                Path(temp_dir),
+                text_responder=responder,
+                text_chunk_size=20,
+            )
+            events = list(
+                engine.execute_stream(
+                    execution_request(self._stream_task(minimum_length=2))
+                )
+            )
+
+            names = [item.event for item in events]
+            self.assertEqual(names.count("content.reset"), 1)
+            self.assertLess(names.index("content.reset"), names.index("execution.completed"))
+            self.assertEqual(events[-1].envelope.result, {"reply": "fixed"})
+            self.assertEqual(events[-1].envelope.timing["contractRepairs"], 1)
+            self.assertEqual(provider.call_count, 2)
+
+    def test_text_stream_close_marks_execution_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, _provider = engine_with_mock(
+                Path(temp_dir),
+                text_responder=lambda _payload, _feedback: "long answer",
+                text_chunk_size=2,
+            )
+            stream = engine.execute_stream(execution_request(self._stream_task()))
+            started = next(stream)
+            next(stream)
+            next(stream)
+            stream.close()
+
+            persisted = engine.get_execution(started.execution_id)
+            self.assertEqual(persisted.status, "cancelled")
+            self.assertEqual(persisted.progress["event"], "cancelled")
+            self.assertEqual(
+                engine.store.execution_history()["summary"]["cancelled"],
+                1,
+            )
+
+    def test_text_stream_task_is_rejected_by_non_streaming_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir))
+            result = engine.execute(execution_request(self._stream_task()))
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("/v1/executions/stream", result.error)
+            self.assertEqual(provider.call_count, 0)
+
     def test_engine_removes_result_cache_from_older_wire_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

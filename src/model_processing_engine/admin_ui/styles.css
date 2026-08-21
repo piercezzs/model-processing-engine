@@ -590,6 +590,11 @@ h3 {
   background: #fff0f0;
 }
 
+.history-status.cancelled {
+  color: var(--muted);
+  background: #e9edef;
+}
+
 .history-status.running,
 .history-status.queued {
   color: var(--warning);

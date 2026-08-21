@@ -415,7 +415,7 @@ class SQLiteRuntimeStore:
             ).fetchall()
             for row in rows:
                 execution_id = str(row["execution_id"])
-                if str(row["record_status"]) in {"succeeded", "failed"}:
+                if str(row["record_status"]) in {"succeeded", "failed", "cancelled"}:
                     connection.execute(
                         "DELETE FROM async_execution_queue WHERE execution_id = ?",
                         (execution_id,),
@@ -901,7 +901,13 @@ def _execution_summary(
 
 
 def _execution_aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
-    statuses = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0}
+    statuses = {
+        "queued": 0,
+        "running": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
     usage_fields = (
         "inputTokens",
         "outputTokens",
@@ -1051,6 +1057,7 @@ def _execution_series(
                     "executions": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "cancelled": 0,
                     "providerCalls": 0,
                     "totalTokens": 0,
                     "cacheReadInputTokens": 0,
@@ -1067,6 +1074,7 @@ def _execution_series(
                     "executions": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "cancelled": 0,
                     "providerCalls": 0,
                     "totalTokens": 0,
                     "cacheReadInputTokens": 0,
@@ -1082,6 +1090,7 @@ def _execution_series(
                     "executions": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "cancelled": 0,
                     "providerCalls": 0,
                     "totalTokens": 0,
                     "cacheReadInputTokens": 0,
@@ -1099,7 +1108,7 @@ def _execution_series(
         bucket = buckets[index]
         bucket["executions"] += 1
         status = item.get("status")
-        if status in {"succeeded", "failed"}:
+        if status in {"succeeded", "failed", "cancelled"}:
             bucket[status] += 1
         timing = item.get("timing", {})
         usage = item.get("usage", {})
@@ -1131,6 +1140,7 @@ def _execution_model_breakdown(
                 "executions": 0,
                 "succeeded": 0,
                 "failed": 0,
+                "cancelled": 0,
                 "providerCalls": 0,
                 "elapsedMs": 0,
                 "elapsedAvailable": 0,
@@ -1144,7 +1154,7 @@ def _execution_model_breakdown(
         )
         group["executions"] += 1
         status = item.get("status")
-        if status in {"succeeded", "failed"}:
+        if status in {"succeeded", "failed", "cancelled"}:
             group[status] += 1
         timing = item.get("timing", {})
         group["providerCalls"] += _non_negative_int(
@@ -1168,6 +1178,7 @@ def _execution_model_breakdown(
                 "executions": group["executions"],
                 "succeeded": group["succeeded"],
                 "failed": group["failed"],
+                "cancelled": group["cancelled"],
                 "providerCalls": group["providerCalls"],
                 "successRate": round(
                     group["succeeded"] / terminal * 100,

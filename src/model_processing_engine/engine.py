@@ -13,9 +13,27 @@ from jsonschema import Draft202012Validator
 
 from .cache import CacheRecord, SQLiteRuntimeStore
 from .canonical import digest_json, field_value
-from .contracts import ExecutionRequest, ResultEnvelope, TaskDefinition
-from .exceptions import ContractValidationError, ExecutionNotFoundError, ProviderError
-from .providers.base import ModelProvider, ProviderCallResult, ProviderRegistry
+from .contracts import (
+    ExecutionRequest,
+    ExecutionStreamEvent,
+    ResultEnvelope,
+    TaskDefinition,
+)
+from .exceptions import (
+    ConfigurationError,
+    ContractValidationError,
+    ExecutionNotFoundError,
+    ProviderError,
+)
+from .providers.base import (
+    ModelProvider,
+    ProviderCallResult,
+    ProviderRegistry,
+    ProviderTextCompleted,
+    ProviderTextDelta,
+    ProviderTextEvent,
+    ProviderTextResult,
+)
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -115,6 +133,10 @@ class ModelProcessingEngine:
 
         try:
             validate_instance(request.input_payload, request.task.input_schema, label="input")
+            if request.task.stream_policy.mode != "disabled":
+                raise ContractValidationError(
+                    "streaming tasks must use POST /v1/executions/stream"
+                )
             provider = self.providers.get(
                 request.runtime.provider_id or request.task.runtime_defaults.provider_id
             )
@@ -254,6 +276,246 @@ class ModelProcessingEngine:
             )
         self._save_execution(request.task, envelope)
         return ResultEnvelope.model_validate(envelope)
+
+    def validate_stream_request(self, request: ExecutionRequest) -> None:
+        if request.async_mode:
+            raise ContractValidationError("streaming executions do not support asyncMode")
+        if request.task.stream_policy.mode != "text_field":
+            raise ContractValidationError(
+                "streaming executions require task.streamPolicy.mode=text_field"
+            )
+        validate_instance(request.input_payload, request.task.input_schema, label="input")
+        provider = self.providers.get(
+            request.runtime.provider_id or request.task.runtime_defaults.provider_id
+        )
+        if "text_stream" not in provider.config.capabilities:
+            raise ConfigurationError(
+                f"Provider {provider.config.id} does not declare text_stream capability"
+            )
+        model = (
+            request.runtime.model
+            or request.task.runtime_defaults.model
+            or provider.config.default_model
+        ).strip()
+        if not model:
+            raise ConfigurationError(f"Provider {provider.config.id} requires a model")
+
+    def execute_stream(
+        self,
+        request: ExecutionRequest,
+        *,
+        execution_id: str | None = None,
+    ) -> Iterator[ExecutionStreamEvent]:
+        self.validate_stream_request(request)
+        execution_id = execution_id or uuid4().hex
+        started_timer = time.perf_counter()
+        envelope = self._base_envelope(request.task, execution_id=execution_id, status="running")
+        envelope["timing"]["startedAt"] = _utc_now()
+        provider = self.providers.get(
+            request.runtime.provider_id or request.task.runtime_defaults.provider_id
+        )
+        model = (
+            request.runtime.model
+            or request.task.runtime_defaults.model
+            or provider.config.default_model
+        ).strip()
+        temperature = (
+            request.runtime.temperature
+            if request.runtime.temperature is not None
+            else request.task.runtime_defaults.temperature
+        )
+        max_tokens = (
+            request.runtime.max_tokens
+            if request.runtime.max_tokens is not None
+            else request.task.runtime_defaults.max_tokens
+        )
+        contract_retries = (
+            request.runtime.contract_retries
+            if request.runtime.contract_retries is not None
+            else request.task.runtime_defaults.contract_retries
+        )
+        envelope["provider"] = {
+            "id": provider.config.id,
+            "type": provider.config.type,
+            "model": model,
+            "identityDigest": provider.config.digest,
+        }
+        envelope["cache"] = {
+            "mode": "disabled",
+            "hit": False,
+            "key": None,
+            "forceRefresh": request.runtime.force_refresh,
+        }
+        envelope["progress"] = {"event": "streaming", "attempt": 0}
+        self._save_execution(request.task, envelope)
+
+        sequence = 0
+        calls: list[ProviderTextResult] = []
+        active_provider_stream: Iterator[ProviderTextEvent] | None = None
+        terminal_saved = False
+
+        def event(
+            name: str,
+            *,
+            attempt_id: str | None = None,
+            delta: str | None = None,
+            reason: str | None = None,
+            final_envelope: ResultEnvelope | None = None,
+        ) -> ExecutionStreamEvent:
+            nonlocal sequence
+            sequence += 1
+            return ExecutionStreamEvent(
+                sequence=sequence,
+                executionId=execution_id,
+                event=name,
+                attemptId=attempt_id,
+                delta=delta,
+                reason=reason,
+                envelope=final_envelope,
+            )
+
+        try:
+            yield event("execution.started")
+            repair_feedback: str | None = None
+            previous_output: str | None = None
+            result_field = request.task.stream_policy.result_field
+            for repair_attempt in range(contract_retries + 1):
+                attempt_id = f"attempt-{repair_attempt + 1}"
+                envelope["progress"] = {
+                    "event": "provider_call_started",
+                    "attempt": repair_attempt + 1,
+                    "attemptId": attempt_id,
+                }
+                self._save_execution(request.task, envelope)
+                yield event("attempt.started", attempt_id=attempt_id)
+                text_call: ProviderTextResult | None = None
+                active_provider_stream = self._stream_provider_call(
+                    execution_id=execution_id,
+                    sequence=repair_attempt + 1,
+                    purpose="task" if repair_attempt == 0 else "contract_repair",
+                    task=request.task,
+                    input_payload=request.input_payload,
+                    provider=provider,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    repair_feedback=repair_feedback,
+                    previous_output=previous_output,
+                )
+                try:
+                    for provider_event in active_provider_stream:
+                        if isinstance(provider_event, ProviderTextDelta):
+                            yield event(
+                                "content.delta",
+                                attempt_id=attempt_id,
+                                delta=provider_event.delta,
+                            )
+                        elif isinstance(provider_event, ProviderTextCompleted):
+                            text_call = provider_event.result
+                finally:
+                    close_stream = getattr(active_provider_stream, "close", None)
+                    if callable(close_stream):
+                        close_stream()
+                    active_provider_stream = None
+                if text_call is None:
+                    raise ProviderError("Provider stream ended without a completion event")
+                calls.append(text_call)
+                candidate = {result_field: text_call.text}
+                yield event("validation.started", attempt_id=attempt_id)
+                try:
+                    validate_instance(candidate, request.task.output_schema, label="output")
+                except ContractValidationError as exc:
+                    if repair_attempt >= contract_retries:
+                        raise
+                    repair_feedback = str(exc)
+                    previous_output = text_call.text
+                    envelope["progress"] = {
+                        "event": "provider_contract_repair",
+                        "attempt": repair_attempt + 1,
+                        "repairLimit": contract_retries,
+                    }
+                    self._save_execution(request.task, envelope)
+                    yield event(
+                        "content.reset",
+                        attempt_id=attempt_id,
+                        reason=_safe_error(exc),
+                    )
+                    continue
+
+                report = _provider_text_report(
+                    calls,
+                    contract_repairs=repair_attempt,
+                )
+                envelope.update(
+                    {
+                        "status": "succeeded",
+                        "usage": _merge_text_usage(calls),
+                        "result": candidate,
+                        "progress": {"event": "completed", "processed": 1},
+                    }
+                )
+                envelope["timing"].update(
+                    {
+                        "completedAt": _utc_now(),
+                        "elapsedMs": _elapsed_ms(started_timer),
+                        **report,
+                    }
+                )
+                self._save_execution(request.task, envelope)
+                terminal_saved = True
+                yield event(
+                    "execution.completed",
+                    final_envelope=ResultEnvelope.model_validate(envelope),
+                )
+                return
+            raise AssertionError("stream contract repair loop exited without a result")
+        except GeneratorExit:
+            if terminal_saved:
+                raise
+            if active_provider_stream is not None:
+                close_stream = getattr(active_provider_stream, "close", None)
+                if callable(close_stream):
+                    close_stream()
+            envelope.update(
+                {
+                    "status": "cancelled",
+                    "usage": _merge_text_usage(calls),
+                    "progress": {"event": "cancelled"},
+                    "result": None,
+                }
+            )
+            envelope["timing"].update(
+                {
+                    "completedAt": _utc_now(),
+                    "elapsedMs": _elapsed_ms(started_timer),
+                    **_provider_text_report(calls),
+                }
+            )
+            self._save_execution(request.task, envelope)
+            raise
+        except Exception as exc:
+            envelope.update(
+                {
+                    "status": "failed",
+                    "usage": _merge_text_usage(calls),
+                    "error": _safe_error(exc),
+                    "progress": {"event": "failed"},
+                    "result": None,
+                }
+            )
+            envelope["timing"].update(
+                {
+                    "completedAt": _utc_now(),
+                    "elapsedMs": _elapsed_ms(started_timer),
+                    **_provider_text_report(calls),
+                }
+            )
+            self._save_execution(request.task, envelope)
+            yield event(
+                "execution.failed",
+                reason=_safe_error(exc),
+                final_envelope=ResultEnvelope.model_validate(envelope),
+            )
 
     def get_execution(self, execution_id: str) -> ResultEnvelope:
         record = self.store.get_execution(execution_id)
@@ -499,6 +761,100 @@ class ModelProcessingEngine:
         )
         return call
 
+    def _stream_provider_call(
+        self,
+        *,
+        execution_id: str,
+        sequence: int,
+        purpose: str,
+        task: TaskDefinition,
+        input_payload: dict[str, Any],
+        provider: ModelProvider,
+        model: str,
+        temperature: float,
+        max_tokens: int | None,
+        repair_feedback: str | None,
+        previous_output: str | None,
+    ) -> Iterator[ProviderTextEvent]:
+        model_payload = {"input": input_payload}
+        if task.taxonomy is not None:
+            model_payload = {"taxonomy": task.taxonomy, **model_payload}
+        call_id = uuid4().hex
+        completed: ProviderTextResult | None = None
+        try:
+            with self._provider_slots[provider.config.id]:
+                for provider_event in provider.stream_text(
+                    model=model,
+                    system_prompt=task.prompt,
+                    input_payload=model_payload,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    repair_feedback=repair_feedback,
+                    previous_output=previous_output,
+                ):
+                    if isinstance(provider_event, ProviderTextCompleted):
+                        completed = provider_event.result
+                    yield provider_event
+            if completed is None:
+                raise ProviderError("Provider stream ended without a completion event")
+        except GeneratorExit:
+            self.store.save_provider_call(
+                {
+                    "callId": call_id,
+                    "executionId": execution_id,
+                    "purpose": purpose,
+                    "sequence": sequence,
+                    "providerId": provider.config.id,
+                    "model": model,
+                    "status": "cancelled",
+                    "usage": {},
+                    "attempts": 0,
+                    "elapsedMs": 0,
+                    "error": "Client disconnected during provider stream",
+                }
+            )
+            raise
+        except Exception as exc:
+            usage = dict(exc.usage) if isinstance(exc, ProviderError) else {}
+            attempts = exc.attempts if isinstance(exc, ProviderError) else 0
+            elapsed_ms = exc.elapsed_ms if isinstance(exc, ProviderError) else 0
+            audit_error = (
+                exc.audit_message
+                if isinstance(exc, ProviderError)
+                else exc.__class__.__name__
+            )
+            self.store.save_provider_call(
+                {
+                    "callId": call_id,
+                    "executionId": execution_id,
+                    "purpose": purpose,
+                    "sequence": sequence,
+                    "providerId": provider.config.id,
+                    "model": model,
+                    "status": "failed",
+                    "usage": usage,
+                    "attempts": attempts,
+                    "elapsedMs": elapsed_ms,
+                    "error": audit_error,
+                }
+            )
+            raise
+        self.store.save_provider_call(
+            {
+                "callId": call_id,
+                "executionId": execution_id,
+                "purpose": purpose,
+                "sequence": sequence,
+                "providerId": provider.config.id,
+                "model": model,
+                "status": "succeeded",
+                "usage": completed.usage,
+                "attempts": completed.attempts,
+                "elapsedMs": completed.elapsed_ms,
+                "error": "",
+            }
+        )
+
     def _cache_key(
         self,
         *,
@@ -710,6 +1066,35 @@ def _provider_report(
         "contractRepairs": max(0, contract_repairs),
         "providerElapsedMs": sum(call.elapsed_ms for call in calls),
         "processed": processed,
+    }
+
+
+def _merge_text_usage(calls: list[ProviderTextResult]) -> dict[str, Any]:
+    fields = ["inputTokens", "outputTokens", "totalTokens", "cacheReadInputTokens"]
+    return {
+        "available": any(bool(call.usage.get("available")) for call in calls),
+        **{
+            field: sum(int(call.usage.get(field) or 0) for call in calls)
+            for field in fields
+        },
+        "source": (
+            "provider_response"
+            if any(call.usage.get("available") for call in calls)
+            else "provider_response_without_usage"
+        ),
+    }
+
+
+def _provider_text_report(
+    calls: list[ProviderTextResult],
+    *,
+    contract_repairs: int = 0,
+) -> dict[str, int]:
+    return {
+        "providerCallCount": len(calls),
+        "transportRetries": sum(max(0, call.attempts - 1) for call in calls),
+        "contractRepairs": max(0, contract_repairs),
+        "providerElapsedMs": sum(call.elapsed_ms for call in calls),
     }
 
 

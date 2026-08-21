@@ -67,10 +67,20 @@ start_mpe.bat
 依赖指纹，脚本会直接采用该环境并补记指纹，不会为此发起不必要的联网安装。
 服务身份识别和端口冲突处理由 MPE 已验证的进程管理器负责。脚本不会仅仅因为
 端口 `8787` 被占用就终止相关进程。
+每次正常运行启动脚本时都会使用经过身份验证的 `restart` 操作：托管服务未运行时
+会启动服务，已运行时则会替换经过验证的旧实例，从而加载当前源码和 Provider
+配置。需要显式保留幂等语义的调用方仍可直接使用底层 `mpe start` 命令。
+
+自动化工具或本地控制面可以使用 `--start-only --no-open`，在复用同一环境修复流程的
+同时执行幂等的 `mpe start`；已经健康运行的实例不会被替换。无参数的一键启动入口
+仍保持刷新当前托管服务的语义。
 
 完成配置后，可以通过 `./start_mpe.command --check-only`（macOS）或
 `start_mpe.bat --check-only`（Windows）执行不会启动服务的就绪检查。使用
 `./stop_mpe.command` 或 `stop_mpe.bat` 停止经过身份验证的托管服务。
+
+已经信任仓库环境已就绪的本地控制面，可以使用 `--status-only` 获取轻量、只读的
+JSON 服务状态，而不重复执行依赖校验。
 
 正常的一键启动会在健康检查通过后打开 `/admin` 回环管理页面。使用
 `--no-open` 可以启动服务但不打开浏览器。远程绑定时，管理页面会被禁用。
@@ -200,6 +210,26 @@ tasks/example/
 敏感任务必须同步执行。其结果会返回给当前调用方，但不会写入持久化执行记录或
 结果缓存。
 
+### 纯文本流式任务
+
+调用方需要逐步显示助手文本时，可将 `streamPolicy.mode` 设置为 `text_field`：
+
+```json
+{
+  "streamPolicy": {"mode": "text_field", "resultField": "reply"},
+  "cachePolicy": {"mode": "disabled", "sensitive": true}
+}
+```
+
+输出 Schema 必须是对象，且唯一的必填属性应为 `resultField` 指定的字符串字段。
+流式任务不能使用批处理、异步队列或 MPE 结果缓存。Provider 发送纯文本增量，MPE
+将其聚合成 `{resultField: fullText}`，完成常规输出 Schema 校验后才发送权威完成
+Envelope。
+
+如果需要契约修复，流会在下一次尝试前发送 `content.reset`，调用方必须丢弃上一次
+尝试的暂存文本。只有 `execution.completed` 代表可持久化的成功结果；调用方断开后
+执行会记录为 `cancelled`，不把部分文本作为结果持久化。
+
 Task 文件不能逃逸其目录。输入和输出 Schema 可以使用 `#/$defs/Item` 等本地
 JSON Schema 片段；外部 `$ref` 会被拒绝，避免校验过程获取不受信任的远程资源。
 
@@ -292,6 +322,7 @@ ID；无法验证的活动 PID 永远不会被终止。
 - `GET /v1/health`
 - `GET /v1/providers`
 - `POST /v1/executions`
+- `POST /v1/executions/stream`（`text_field` 任务的 SSE）
 - `GET /v1/executions/{execution_id}`
 - `POST /v1/cache/cleanup`
 - `GET /admin`（回环管理页面）
@@ -305,6 +336,13 @@ ID；无法验证的活动 PID 永远不会被终止。
 HTTP 请求包含解析后的 `TaskDefinition` 和输入数据，不包含服务器端 Task 目录
 路径，从而保持文件系统归调用项目所有。将 `asyncMode` 设置为 `true` 后，会先
 收到 queued envelope，再轮询执行路由。
+
+`POST /v1/executions/stream` 返回 `text/event-stream`。事件通过单调递增的
+`sequence` 排序，名称包括 `execution.started`、`attempt.started`、
+`content.delta`、`content.reset`、`validation.started`、
+`execution.completed` 和 `execution.failed`。最后两类事件携带完整
+`ResultEnvelope`。客户端断开造成的取消会保留在执行历史中；由于连接已经断开，
+不会再向该客户端发送 `execution.cancelled`。
 
 默认主机是 `127.0.0.1`。非回环绑定必须同时设置 `MPE_ALLOW_REMOTE=1` 和
 `MPE_API_TOKEN`；经过认证的路由随后要求
@@ -336,8 +374,8 @@ at-least-once；已经存在终态快照的任务不会再次执行。多个可�
 `config/providers.json` 展示了支持的 Provider 类型：
 
 - `mock`：根据 Schema 生成确定性结果，用于测试和集成配置。
-- `openai_compatible`：使用 JSON Chat Completions 传输，并对限流、服务器错误、
-  超时和连接失败执行有限次数的重试。
+- `openai_compatible`：使用 JSON 和纯文本 SSE Chat Completions 传输，并对限流、
+  服务器错误、超时和连接失败执行有限次数的重试。
 
 OpenAI-compatible 的正常响应体和错误响应体均使用 8 MiB 硬上限读取。模型执行和
 模型发现都会在 JSON 解码前应用该限制，避免配置错误或恶意端点通过无界响应耗尽
@@ -347,7 +385,9 @@ Provider 配置可以声明 `availableModels`、`capabilities` 和 `maxConcurren
 `/v1/providers` 响应会公开这些非秘密声明，同时保留原有 Provider ID 列表以保持
 兼容性。`structured_json` 使用 JSON-object 模式；`native_json_schema` 会通过
 Provider 的严格 JSON Schema 请求字段发送任务输出 Schema，只应为已知兼容的
-平台/模型组合启用。`maxConcurrency` 会针对每个 Provider 独立执行，并覆盖所有
+平台/模型组合启用。`text_stream` 启用纯文本 SSE 调用；只有首个内容增量发送前
+发生的传输错误才会自动重试，一旦内容已对调用方可见，后续传输失败就会直接终止，
+避免静默重试造成重复文本。`maxConcurrency` 会针对每个 Provider 独立执行，并覆盖所有
 调用方。环境级 `MPE_MAX_PROVIDER_CONCURRENCY` 仍是整个服务的安全上限；最终生效
 值是两者中较小的一个。
 

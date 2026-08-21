@@ -52,6 +52,24 @@ class BatchPolicy(StrictModel):
     concurrency: int = Field(default=1, ge=1, le=8)
 
 
+class StreamPolicy(StrictModel):
+    mode: Literal["disabled", "text_field"] = "disabled"
+    result_field: str = Field(
+        default="content",
+        alias="resultField",
+        min_length=1,
+        max_length=128,
+    )
+
+    @field_validator("result_field")
+    @classmethod
+    def validate_result_field(cls, value: str) -> str:
+        text = value.strip()
+        if not IDENTIFIER_PATTERN.fullmatch(text):
+            raise ValueError("must use letters, numbers, dot, underscore, or hyphen")
+        return text
+
+
 class TaskDefinition(StrictModel):
     schema_version: int = Field(default=1, alias="schemaVersion", ge=1, le=1)
     namespace: str
@@ -65,6 +83,7 @@ class TaskDefinition(StrictModel):
     cache_policy: CachePolicy = Field(default_factory=CachePolicy, alias="cachePolicy")
     runtime_defaults: RuntimeDefaults = Field(default_factory=RuntimeDefaults, alias="runtimeDefaults")
     batch_policy: BatchPolicy = Field(default_factory=BatchPolicy, alias="batchPolicy")
+    stream_policy: StreamPolicy = Field(default_factory=StreamPolicy, alias="streamPolicy")
 
     @field_validator("namespace", "id")
     @classmethod
@@ -85,10 +104,35 @@ class TaskDefinition(StrictModel):
             raise ValueError("inputSchema must not be empty")
         if not self.output_schema:
             raise ValueError("outputSchema must not be empty")
+        if self.stream_policy.mode == "text_field":
+            if self.cache_policy.mode != "disabled":
+                raise ValueError("text_field streaming tasks must disable result caching")
+            if self.batch_policy.enabled:
+                raise ValueError("text_field streaming tasks do not support batching")
+            if self.output_schema.get("type") != "object":
+                raise ValueError("text_field streaming outputSchema must describe an object")
+            properties = self.output_schema.get("properties")
+            field_schema = (
+                properties.get(self.stream_policy.result_field)
+                if isinstance(properties, dict)
+                else None
+            )
+            if not isinstance(field_schema, dict) or field_schema.get("type") != "string":
+                raise ValueError(
+                    "text_field streaming resultField must reference a string property"
+                )
+            required = self.output_schema.get("required")
+            required_fields = required if isinstance(required, list) else []
+            if self.stream_policy.result_field not in required_fields:
+                raise ValueError("text_field streaming resultField must be required")
+            if set(required_fields) != {self.stream_policy.result_field}:
+                raise ValueError(
+                    "text_field streaming does not support other required output fields"
+                )
         return self
 
     def digest_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schemaVersion": self.schema_version,
             "namespace": self.namespace,
             "id": self.id,
@@ -99,6 +143,9 @@ class TaskDefinition(StrictModel):
             "taxonomy": self.taxonomy,
             "batchPolicy": self.batch_policy.model_dump(by_alias=True),
         }
+        if self.stream_policy.mode != "disabled":
+            payload["streamPolicy"] = self.stream_policy.model_dump(by_alias=True)
+        return payload
 
     @property
     def digest(self) -> str:
@@ -141,13 +188,15 @@ class ExecutionRequest(StrictModel):
     def validate_sensitive_execution(self) -> "ExecutionRequest":
         if self.task.cache_policy.sensitive and self.async_mode:
             raise ValueError("sensitive tasks must use synchronous execution")
+        if self.task.stream_policy.mode == "text_field" and self.async_mode:
+            raise ValueError("text_field streaming tasks do not support asyncMode")
         return self
 
 
 class ResultEnvelope(StrictModel):
     schema_version: int = Field(default=1, alias="schemaVersion")
     execution_id: str = Field(alias="executionId")
-    status: Literal["queued", "running", "succeeded", "failed"]
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
     task: dict[str, Any]
     provider: dict[str, Any] = Field(default_factory=dict)
     cache: dict[str, Any] = Field(default_factory=dict)
@@ -157,3 +206,23 @@ class ResultEnvelope(StrictModel):
     result: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
+
+
+class ExecutionStreamEvent(StrictModel):
+    schema_version: int = Field(default=1, alias="schemaVersion", ge=1, le=1)
+    sequence: int = Field(ge=1)
+    execution_id: str = Field(alias="executionId", min_length=1, max_length=128)
+    event: Literal[
+        "execution.started",
+        "attempt.started",
+        "content.delta",
+        "content.reset",
+        "validation.started",
+        "execution.completed",
+        "execution.failed",
+        "execution.cancelled",
+    ]
+    attempt_id: str | None = Field(default=None, alias="attemptId", max_length=128)
+    delta: str | None = None
+    reason: str | None = Field(default=None, max_length=1_000)
+    envelope: ResultEnvelope | None = None

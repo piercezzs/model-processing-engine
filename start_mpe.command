@@ -8,6 +8,8 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python"
 DEPENDENCY_STAMP="$VENV_DIR/.mpe-pyproject.sha256"
 CHECK_ONLY=0
+STATUS_ONLY=0
+START_ONLY=0
 OPEN_ADMIN=1
 
 fail() {
@@ -63,8 +65,10 @@ find_compatible_python() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check-only) CHECK_ONLY=1; OPEN_ADMIN=0 ;;
+        --status-only) STATUS_ONLY=1; OPEN_ADMIN=0 ;;
+        --start-only) START_ONLY=1; OPEN_ADMIN=0 ;;
         --no-open) OPEN_ADMIN=0 ;;
-        *) fail "Usage: ./start_mpe.command [--check-only] [--no-open]" ;;
+        *) fail "Usage: ./start_mpe.command [--check-only] [--status-only] [--start-only] [--no-open]" ;;
     esac
     shift
 done
@@ -72,6 +76,13 @@ done
 
 cd "$SCRIPT_DIR" || fail "Cannot enter $SCRIPT_DIR"
 export MPE_PROJECT_DIR="$SCRIPT_DIR"
+
+if [ "$STATUS_ONLY" -eq 1 ]; then
+    [ -x "$VENV_PYTHON" ] || fail \
+        "The local environment is not ready. Run ./start_mpe.command once to repair it."
+    "$VENV_PYTHON" -m model_processing_engine.cli status
+    exit $?
+fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     environment_is_ready || fail \
@@ -120,8 +131,13 @@ else
     environment_is_ready || fail "The repaired environment did not pass validation"
 fi
 
-printf '[MPE] Starting the managed service\n'
-"$VENV_PYTHON" -m model_processing_engine.cli start || exit $?
+if [ "$START_ONLY" -eq 1 ]; then
+    printf '[MPE] Ensuring the managed service is running\n'
+    "$VENV_PYTHON" -m model_processing_engine.cli start || exit $?
+else
+    printf '[MPE] Starting or restarting the managed service\n'
+    "$VENV_PYTHON" -m model_processing_engine.cli restart || exit $?
+fi
 "$VENV_PYTHON" -m model_processing_engine.cli status
 if [ "$OPEN_ADMIN" -eq 1 ]; then
     printf '[MPE] Opening the local management page\n'
