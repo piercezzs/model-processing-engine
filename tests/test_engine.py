@@ -6,9 +6,11 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import PropertyMock, patch
 
 from model_processing_engine.cache import SQLiteRuntimeStore
-from model_processing_engine.engine import ENGINE_CACHE_SCHEMA
+from model_processing_engine.contracts import TaskDefinition
+from model_processing_engine.engine import ENGINE_CACHE_SCHEMA, MAX_BATCH_CHUNKS
 from model_processing_engine.providers.base import ProviderCallResult
 
 from tests.helpers import engine_with_mock, execution_request, task_definition
@@ -185,6 +187,33 @@ class EngineTests(unittest.TestCase):
             self.assertFalse(first.cache["hit"])
             self.assertTrue(second.cache["hit"])
             self.assertEqual(provider.call_count, 1)
+
+    def test_task_fingerprints_are_computed_once_per_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir), responder=summary_responder)
+            request = execution_request(task_definition(), {"text": "hello"})
+            with (
+                patch.object(
+                    TaskDefinition,
+                    "digest",
+                    new_callable=PropertyMock,
+                    return_value="sha256:stable-task",
+                ) as task_digest,
+                patch.object(
+                    TaskDefinition,
+                    "component_hashes",
+                    new_callable=PropertyMock,
+                    return_value={"prompt": "sha256:stable-component"},
+                ) as component_hashes,
+            ):
+                first = engine.execute(request)
+                second = engine.execute(request)
+
+            self.assertEqual(first.status, "succeeded")
+            self.assertTrue(second.cache["hit"])
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual(task_digest.call_count, 2)
+            self.assertEqual(component_hashes.call_count, 2)
 
     def test_force_refresh_bypasses_cache(self) -> None:
         responses = iter(("original", "refreshed"))
@@ -389,6 +418,14 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(all(result.status == "succeeded" for result in results))
             self.assertEqual(provider.call_count, 1)
             self.assertEqual(sum(bool(result.cache["hit"]) for result in results), 7)
+            self.assertEqual(
+                sorted(
+                    int(result.cache["hitCount"])
+                    for result in results
+                    if result.cache["hit"]
+                ),
+                list(range(1, 8)),
+            )
 
     def test_provider_concurrency_is_bounded_by_provider_configuration(self) -> None:
         active = 0
@@ -490,6 +527,210 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual([item["id"] for item in result.result["items"]], list(range(5)))
             self.assertEqual(provider.call_count, 3)
+
+    def test_batch_submission_window_and_input_key_order_are_preserved(self) -> None:
+        submitted = 0
+        submit_lock = threading.Lock()
+        first_window_submitted = threading.Event()
+        release_provider = threading.Event()
+        input_key_orders: list[list[str]] = []
+
+        class CountingExecutor(ThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                nonlocal submitted
+                with submit_lock:
+                    submitted += 1
+                    if submitted == 2:
+                        first_window_submitted.set()
+                return super().submit(*args, **kwargs)
+
+        def responder(payload, _schema):
+            input_key_orders.append(list(payload["input"]))
+            release_provider.wait(timeout=2)
+            return {"items": list(payload["input"]["items"])}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir), responder=responder)
+            task = task_definition(
+                cache_policy={"mode": "disabled"},
+                batch_policy={
+                    "enabled": True,
+                    "inputField": "items",
+                    "outputField": "items",
+                    "chunkSize": 1,
+                    "concurrency": 2,
+                },
+                input_schema={
+                    "type": "object",
+                    "required": ["before", "items", "after"],
+                    "properties": {
+                        "before": {"type": "string"},
+                        "items": {"type": "array", "items": {"type": "integer"}},
+                        "after": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {
+                        "items": {"type": "array", "items": {"type": "integer"}}
+                    },
+                    "additionalProperties": False,
+                },
+            )
+            request = execution_request(
+                task,
+                {"before": "a", "items": list(range(6)), "after": "z"},
+            )
+            with (
+                patch("model_processing_engine.engine.ThreadPoolExecutor", CountingExecutor),
+                ThreadPoolExecutor(max_workers=1) as caller,
+            ):
+                result_future = caller.submit(engine.execute, request)
+                self.assertTrue(first_window_submitted.wait(timeout=1))
+                time.sleep(0.05)
+                self.assertEqual(submitted, 2)
+                release_provider.set()
+                result = result_future.result(timeout=3)
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.result, {"items": list(range(6))})
+            self.assertEqual(provider.call_count, 6)
+            self.assertTrue(input_key_orders)
+            self.assertTrue(
+                all(order == ["before", "items", "after"] for order in input_key_orders)
+            )
+
+    def test_batch_chunk_limit_rejects_before_provider_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir))
+            task = task_definition(
+                cache_policy={"mode": "disabled"},
+                batch_policy={
+                    "enabled": True,
+                    "inputField": "items",
+                    "outputField": "items",
+                    "chunkSize": 1,
+                    "concurrency": 8,
+                },
+                input_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+            )
+            result = engine.execute(
+                execution_request(task, {"items": [None] * (MAX_BATCH_CHUNKS + 1)})
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("exceeding the limit", result.error)
+            self.assertEqual(provider.call_count, 0)
+
+    def test_batch_chunk_limit_accepts_exact_boundary(self) -> None:
+        def fast_provider_call(**kwargs):
+            call = ProviderCallResult(
+                content={"items": list(kwargs["input_payload"]["items"])},
+                usage={
+                    "available": False,
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 0,
+                },
+                attempts=1,
+                elapsed_ms=0,
+            )
+            return call, [call]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir))
+            task = task_definition(
+                cache_policy={"mode": "disabled"},
+                batch_policy={
+                    "enabled": True,
+                    "inputField": "items",
+                    "outputField": "items",
+                    "chunkSize": 1,
+                    "concurrency": 8,
+                },
+                input_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+            )
+            with patch.object(
+                engine,
+                "_provider_call_with_contract_repair",
+                side_effect=fast_provider_call,
+            ):
+                result = engine.execute(
+                    execution_request(task, {"items": [None] * MAX_BATCH_CHUNKS})
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(result.result["items"]), MAX_BATCH_CHUNKS)
+            self.assertEqual(provider.call_count, 0)
+
+    def test_fast_batch_progress_callbacks_do_not_amplify_execution_writes(self) -> None:
+        callback_events: list[str] = []
+
+        def responder(payload, _schema):
+            return {"items": list(payload["input"]["items"])}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir), responder=responder)
+            task = task_definition(
+                cache_policy={"mode": "disabled"},
+                batch_policy={
+                    "enabled": True,
+                    "inputField": "items",
+                    "outputField": "items",
+                    "chunkSize": 1,
+                    "concurrency": 8,
+                },
+                input_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+            )
+            with (
+                patch.object(
+                    engine.store,
+                    "save_execution",
+                    wraps=engine.store.save_execution,
+                ) as save_execution,
+                patch(
+                    "model_processing_engine.engine.PROGRESS_PERSIST_INTERVAL_SECONDS",
+                    3600.0,
+                ),
+            ):
+                result = engine.execute(
+                    execution_request(task, {"items": list(range(20))}),
+                    progress_callback=lambda payload: callback_events.append(payload["event"]),
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(provider.call_count, 20)
+            self.assertEqual(callback_events.count("provider_chunk_completed"), 20)
+            self.assertEqual(save_execution.call_count, 2)
 
     def test_empty_batch_returns_empty_output_without_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

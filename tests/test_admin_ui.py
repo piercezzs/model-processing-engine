@@ -48,6 +48,7 @@ class AdminUiContractTests(unittest.TestCase):
         self.assertIn("/providers/models", script)
         self.assertIn("/execution-stats?", script)
         self.assertIn("/executions?", script)
+        self.assertIn('includeSummary: "false"', script)
         self.assertIn("historyTimezone", script)
         self.assertIn("renderModelBreakdown", script)
         self.assertIn("renderTrend", script)

@@ -526,6 +526,7 @@ function historyListPath(period) {
     offset: String(state.historyOffset),
     createdFrom: String(new Date(period.start).getTime() / 1000),
     createdTo: String(new Date(period.end).getTime() / 1000),
+    includeSummary: "false",
   });
   if (elements.historyKind.value !== "all") {
     parameters.set("kind", elements.historyKind.value);

@@ -175,6 +175,11 @@ class AdminServiceTests(unittest.TestCase):
                 headers=mutation_headers,
             )
             history = client.get("/v1/admin/executions", headers=headers)
+            page_only = client.get(
+                "/v1/admin/executions",
+                params={"includeSummary": "false"},
+                headers=headers,
+            )
 
             self.assertEqual(tested.status_code, 200)
             self.assertTrue(tested.json()["auditExecutionId"].startswith("probe_"))
@@ -182,6 +187,9 @@ class AdminServiceTests(unittest.TestCase):
             self.assertEqual(history.json()["summary"]["providerTests"], 1)
             self.assertEqual(history.json()["items"][0]["kind"], "provider_test")
             self.assertNotIn("result", history.text)
+            self.assertEqual(page_only.status_code, 200)
+            self.assertIsNone(page_only.json()["summary"])
+            self.assertEqual(len(page_only.json()["items"]), 1)
 
     def test_failed_admin_provider_test_is_audited(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

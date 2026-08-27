@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+from model_processing_engine import cache as cache_module
 from model_processing_engine.cache import SQLiteRuntimeStore
 from model_processing_engine.exceptions import AsyncQueueFullError, ConfigurationError
 
@@ -51,6 +52,99 @@ class CacheStoreTests(unittest.TestCase):
             record = second.get_cache("one", "key")
             self.assertIsNotNone(record)
             self.assertEqual(record.result, {"summary": "saved"})
+
+    def test_cache_hit_and_terminal_execution_commit_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
+            with patch("model_processing_engine.cache.time.time", return_value=100.0):
+                store.put_cache(
+                    namespace="one",
+                    key="key",
+                    task_id="task",
+                    task_version="1",
+                    provider_id="mock",
+                    model="mock-v1",
+                    result={"summary": "saved"},
+                    metadata={},
+                    ttl_seconds=None,
+                )
+            cached = store.get_cache("one", "key")
+            assert cached is not None
+            envelope = {
+                "executionId": "cache-hit",
+                "status": "succeeded",
+                "task": {"namespace": "one", "id": "task", "version": "1"},
+                "provider": {"id": "mock", "model": "mock-v1"},
+                "cache": {"hit": True, "hitCount": cached.hit_count},
+            }
+
+            hit_count = store.save_cache_hit_execution(
+                namespace="one",
+                key="key",
+                expected_created_at=cached.created_at,
+                envelope=envelope,
+            )
+
+            self.assertEqual(hit_count, 1)
+            self.assertEqual(envelope["cache"]["hitCount"], 1)
+            self.assertEqual(store.get_cache("one", "key").hit_count, 1)
+            self.assertEqual(store.get_execution("cache-hit")["status"], "succeeded")
+
+            rollback_envelope = {**envelope, "executionId": "rolled-back"}
+            with patch.object(
+                cache_module,
+                "_upsert_execution",
+                side_effect=RuntimeError("write failed"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    store.save_cache_hit_execution(
+                        namespace="one",
+                        key="key",
+                        expected_created_at=cached.created_at,
+                        envelope=rollback_envelope,
+                    )
+            self.assertEqual(store.get_cache("one", "key").hit_count, 1)
+            self.assertIsNone(store.get_execution("rolled-back"))
+
+    def test_stale_cache_generation_cannot_record_a_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
+            common = {
+                "namespace": "one",
+                "key": "key",
+                "task_id": "task",
+                "task_version": "1",
+                "provider_id": "mock",
+                "model": "mock-v1",
+                "metadata": {},
+                "ttl_seconds": None,
+            }
+            with patch("model_processing_engine.cache.time.time", return_value=100.0):
+                store.put_cache(**common, result={"summary": "old"})
+            stale = store.get_cache("one", "key")
+            assert stale is not None
+            with patch("model_processing_engine.cache.time.time", return_value=101.0):
+                store.put_cache(**common, result={"summary": "new"})
+            envelope = {
+                "executionId": "stale-hit",
+                "status": "succeeded",
+                "task": {"namespace": "one", "id": "task", "version": "1"},
+                "cache": {"hit": True},
+            }
+
+            self.assertIsNone(
+                store.save_cache_hit_execution(
+                    namespace="one",
+                    key="key",
+                    expected_created_at=stale.created_at,
+                    envelope=envelope,
+                )
+            )
+            current = store.get_cache("one", "key")
+            assert current is not None
+            self.assertEqual(current.result, {"summary": "new"})
+            self.assertEqual(current.hit_count, 0)
+            self.assertIsNone(store.get_execution("stale-hit"))
 
     @unittest.skipIf(os.name == "nt", "POSIX permission bits are not a Windows security boundary")
     def test_store_secures_direct_sdk_directory_database_and_sidecars(self) -> None:
@@ -247,6 +341,21 @@ class CacheStoreTests(unittest.TestCase):
                 2,
             )
 
+            with patch.object(
+                cache_module,
+                "_execution_summary",
+                wraps=cache_module._execution_summary,
+            ) as summarize:
+                page_only = store.execution_history(
+                    limit=1,
+                    offset=0,
+                    namespace="one",
+                    include_summary=False,
+                )
+            self.assertIsNone(page_only["summary"])
+            self.assertEqual(len(page_only["items"]), 1)
+            self.assertEqual(summarize.call_count, 1)
+
     def test_execution_history_filters_and_period_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
@@ -403,6 +512,47 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(
                 row,
                 ("provider_test", "legacy-provider", "legacy-model"),
+            )
+
+    def test_statistics_provider_filter_does_not_narrow_facets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")
+            recorded_at = 1784772000.0
+            for provider_id, model in (("alpha", "a1"), ("beta", "b1")):
+                with patch(
+                    "model_processing_engine.cache.time.time",
+                    return_value=recorded_at,
+                ):
+                    store.save_execution(
+                        {
+                            "executionId": f"exec-{provider_id}",
+                            "status": "succeeded",
+                            "task": {
+                                "namespace": "project",
+                                "id": "task",
+                                "version": "1",
+                                "kind": "task",
+                            },
+                            "provider": {"id": provider_id, "model": model},
+                            "timing": {"createdAt": "2026-07-23T02:00:00+00:00"},
+                        }
+                    )
+
+            statistics = store.execution_statistics(
+                period="day",
+                anchor="2026-07-23",
+                timezone_name="UTC",
+                provider_id="alpha",
+            )
+
+            self.assertEqual(statistics["summary"]["total"], 1)
+            self.assertEqual(statistics["models"][0]["providerId"], "alpha")
+            self.assertEqual(
+                statistics["facets"]["providers"],
+                [
+                    {"id": "alpha", "models": ["a1"]},
+                    {"id": "beta", "models": ["b1"]},
+                ],
             )
 
 

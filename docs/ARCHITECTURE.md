@@ -185,6 +185,13 @@ forcing the caller to coordinate with other projects using the same MPE
 process. Concurrency settings do not participate in cache identity because they
 change scheduling, not model semantics.
 
+Batch scheduling uses a sliding Future window bounded by the effective Provider
+limit and Task Pack concurrency. It slices each chunk only when submitted,
+preserves the original input-field order, and merges completed chunks by index.
+An execution is limited to 1,000 chunks so caller-controlled inputs cannot create
+unbounded Future queues or Provider-call cost; over-limit requests fail before
+submission and callers must increase chunk size or split the request.
+
 The asynchronous worker count bounds how many execution envelopes may be active
 at once; Provider semaphores remain the final upstream concurrency ceiling.
 Queue capacity bounds queued plus active asynchronous work and applies

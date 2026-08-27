@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
@@ -38,6 +38,8 @@ from .providers.base import (
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 ENGINE_CACHE_SCHEMA = "mpe-cache-v2"
+MAX_BATCH_CHUNKS = 1_000
+PROGRESS_PERSIST_INTERVAL_SECONDS = 0.25
 
 
 class _SingleFlightManager:
@@ -104,7 +106,14 @@ class ModelProcessingEngine:
         persist: bool = True,
     ) -> ResultEnvelope:
         execution_id = uuid4().hex
-        envelope = self._base_envelope(request.task, execution_id=execution_id, status="queued")
+        task_digest, component_hashes = _task_fingerprints(request.task)
+        envelope = self._base_envelope(
+            request.task,
+            execution_id=execution_id,
+            status="queued",
+            task_digest=task_digest,
+            component_hashes=component_hashes,
+        )
         if persist:
             self._save_execution(request.task, envelope)
         return ResultEnvelope.model_validate(envelope)
@@ -118,18 +127,40 @@ class ModelProcessingEngine:
     ) -> ResultEnvelope:
         execution_id = execution_id or uuid4().hex
         started_timer = time.perf_counter()
-        envelope = self._base_envelope(request.task, execution_id=execution_id, status="running")
+        task_digest, component_hashes = _task_fingerprints(request.task)
+        envelope = self._base_envelope(
+            request.task,
+            execution_id=execution_id,
+            status="running",
+            task_digest=task_digest,
+            component_hashes=component_hashes,
+        )
         envelope["timing"]["startedAt"] = _utc_now()
         self._save_execution(request.task, envelope)
 
         progress_lock = threading.Lock()
+        last_progress_persisted = started_timer
 
         def progress(event: str, **fields: Any) -> None:
+            nonlocal last_progress_persisted
             with progress_lock:
                 envelope["progress"] = {"event": event, **fields}
-                self._save_execution(request.task, envelope)
+                now = time.perf_counter()
+                should_persist = (
+                    event in {"provider_contract_repair", "provider_chunk_completed"}
+                    and now - last_progress_persisted >= PROGRESS_PERSIST_INTERVAL_SECONDS
+                )
+                if should_persist:
+                    self._save_execution(request.task, envelope)
+                    last_progress_persisted = now
+                callback_payload = (
+                    copy.deepcopy(envelope["progress"])
+                    if progress_callback
+                    else None
+                )
             if progress_callback:
-                progress_callback(copy.deepcopy(envelope["progress"]))
+                assert callback_payload is not None
+                progress_callback(callback_payload)
 
         try:
             validate_instance(request.input_payload, request.task.input_schema, label="input")
@@ -166,10 +197,13 @@ class ModelProcessingEngine:
                 "model": model,
                 "identityDigest": provider.config.digest,
             }
+            provider_digest = str(envelope["provider"]["identityDigest"])
             cache_key = self._cache_key(
                 task=request.task,
+                task_digest=task_digest,
                 input_payload=request.input_payload,
                 provider=provider,
+                provider_digest=provider_digest,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -180,23 +214,27 @@ class ModelProcessingEngine:
             if cache_allowed and not request.runtime.force_refresh:
                 cached = self._valid_cached_result(request.task, cache_key)
                 if cached:
-                    return self._complete_from_cache(
+                    completed = self._complete_from_cache(
                         request.task,
                         envelope,
                         cached,
                         started_timer=started_timer,
                     )
+                    if completed is not None:
+                        return completed
 
             if cache_allowed and not request.runtime.force_refresh:
                 with self._single_flight.acquire(f"{request.task.namespace}:{cache_key}"):
                     cached = self._valid_cached_result(request.task, cache_key)
                     if cached:
-                        return self._complete_from_cache(
+                        completed = self._complete_from_cache(
                             request.task,
                             envelope,
                             cached,
                             started_timer=started_timer,
                         )
+                        if completed is not None:
+                            return completed
                     result, usage, provider_report = self._run_provider(
                         execution_id=execution_id,
                         task=request.task,
@@ -212,6 +250,9 @@ class ModelProcessingEngine:
                         task=request.task,
                         cache_key=cache_key,
                         provider=provider,
+                        task_digest=task_digest,
+                        component_hashes=component_hashes,
+                        provider_digest=provider_digest,
                         model=model,
                         result=result,
                     )
@@ -232,6 +273,9 @@ class ModelProcessingEngine:
                         task=request.task,
                         cache_key=cache_key,
                         provider=provider,
+                        task_digest=task_digest,
+                        component_hashes=component_hashes,
+                        provider_digest=provider_digest,
                         model=model,
                         result=result,
                     )
@@ -309,7 +353,14 @@ class ModelProcessingEngine:
         self.validate_stream_request(request)
         execution_id = execution_id or uuid4().hex
         started_timer = time.perf_counter()
-        envelope = self._base_envelope(request.task, execution_id=execution_id, status="running")
+        task_digest, component_hashes = _task_fingerprints(request.task)
+        envelope = self._base_envelope(
+            request.task,
+            execution_id=execution_id,
+            status="running",
+            task_digest=task_digest,
+            component_hashes=component_hashes,
+        )
         envelope["timing"]["startedAt"] = _utc_now()
         provider = self.providers.get(
             request.runtime.provider_id or request.task.runtime_defaults.provider_id
@@ -565,23 +616,34 @@ class ModelProcessingEngine:
             raise ContractValidationError(
                 f"batch input field {batch.input_field!r} must be an array"
             )
-        chunks = [items[index : index + batch.chunk_size] for index in range(0, len(items), batch.chunk_size)]
-        if not chunks:
+        chunk_count = (len(items) + batch.chunk_size - 1) // batch.chunk_size
+        if chunk_count == 0:
             empty_result = {batch.output_field: []}
             validate_instance(empty_result, task.output_schema, label="output")
             progress("provider_call_completed", chunkIndex=0, chunkCount=0, processed=0)
             return empty_result, _merge_usage([]), _provider_report([], processed=0)
+        if chunk_count > MAX_BATCH_CHUNKS:
+            raise ContractValidationError(
+                f"batch requires {chunk_count} chunks, exceeding the limit of "
+                f"{MAX_BATCH_CHUNKS}; increase batchPolicy.chunkSize or split the request"
+            )
         results: dict[int, ProviderCallResult] = {}
-        call_records: dict[int, list[ProviderCallResult]] = {}
+        call_records: list[ProviderCallResult] = []
         completed = 0
-        progress("provider_call_started", chunkIndex=0, chunkCount=len(chunks), processed=0)
+        progress("provider_call_started", chunkIndex=0, chunkCount=chunk_count, processed=0)
 
         def call_chunk(
             index: int,
             chunk: list[Any],
         ) -> tuple[int, ProviderCallResult, list[ProviderCallResult]]:
-            chunk_input = copy.deepcopy(input_payload)
-            chunk_input[batch.input_field] = chunk
+            chunk_input = {
+                key: (
+                    copy.deepcopy(chunk)
+                    if key == batch.input_field
+                    else copy.deepcopy(value)
+                )
+                for key, value in input_payload.items()
+            }
             call, calls = self._provider_call_with_contract_repair(
                 execution_id=execution_id,
                 sequence_start=index * (contract_retries + 1) + 1,
@@ -594,43 +656,65 @@ class ModelProcessingEngine:
                 contract_retries=contract_retries,
                 progress=progress,
                 chunk_index=index + 1,
-                chunk_count=len(chunks),
+                chunk_count=chunk_count,
             )
             return index, call, calls
 
         worker_count = min(
-            len(chunks),
+            chunk_count,
             batch.concurrency,
             self._provider_limits[provider.config.id],
         )
+
+        def chunk_at(index: int) -> list[Any]:
+            start = index * batch.chunk_size
+            return items[start : start + batch.chunk_size]
+
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(call_chunk, index, chunk): index
-                for index, chunk in enumerate(chunks)
-            }
-            for future in as_completed(futures):
-                index, call, calls = future.result()
-                results[index] = call
-                call_records[index] = calls
-                completed += len(chunks[index])
-                progress(
-                    "provider_chunk_completed",
-                    chunkIndex=len(results),
-                    chunkCount=len(chunks),
-                    processed=completed,
-                )
-        ordered = [results[index] for index in range(len(chunks))]
-        ordered_calls = [
-            call
-            for index in range(len(chunks))
-            for call in call_records[index]
-        ]
+            pending: dict[
+                Future[tuple[int, ProviderCallResult, list[ProviderCallResult]]],
+                int,
+            ] = {}
+            next_index = 0
+
+            def submit(index: int) -> None:
+                chunk = chunk_at(index)
+                pending[executor.submit(call_chunk, index, chunk)] = len(chunk)
+
+            while next_index < worker_count:
+                submit(next_index)
+                next_index += 1
+
+            while pending:
+                done, _not_done = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                completed_batch: list[
+                    tuple[int, int, ProviderCallResult, list[ProviderCallResult]]
+                ] = []
+                for future in done:
+                    chunk_length = pending.pop(future)
+                    index, call, calls = future.result()
+                    completed_batch.append((chunk_length, index, call, calls))
+                for chunk_length, index, call, calls in completed_batch:
+                    results[index] = call
+                    call_records.extend(calls)
+                    completed += chunk_length
+                    progress(
+                        "provider_chunk_completed",
+                        chunkIndex=len(results),
+                        chunkCount=chunk_count,
+                        processed=completed,
+                    )
+                for _completed_chunk in completed_batch:
+                    if next_index < chunk_count:
+                        submit(next_index)
+                        next_index += 1
+        ordered = [results[index] for index in range(chunk_count)]
         merged = _merge_batch_outputs(ordered, output_field=batch.output_field)
         validate_instance(merged, task.output_schema, label="output")
-        return merged, _merge_usage(ordered_calls), _provider_report(
-            ordered_calls,
+        return merged, _merge_usage(call_records), _provider_report(
+            call_records,
             processed=len(items),
-            contract_repairs=len(ordered_calls) - len(ordered),
+            contract_repairs=len(call_records) - len(ordered),
         )
 
     def _provider_call_with_contract_repair(
@@ -859,8 +943,10 @@ class ModelProcessingEngine:
         self,
         *,
         task: TaskDefinition,
+        task_digest: str,
         input_payload: dict[str, Any],
         provider: ModelProvider,
+        provider_digest: str,
         model: str,
         temperature: float,
         max_tokens: int | None,
@@ -882,10 +968,10 @@ class ModelProcessingEngine:
             {
                 "cacheSchema": ENGINE_CACHE_SCHEMA,
                 "namespace": task.namespace,
-                "taskDigest": task.digest,
+                "taskDigest": task_digest,
                 "semanticVersion": policy.semantic_version,
                 "providerIdentity": provider.config.identity,
-                "providerDigest": provider.config.digest,
+                "providerDigest": provider_digest,
                 "model": model,
                 "temperature": temperature,
                 "maxTokens": max_tokens,
@@ -910,6 +996,9 @@ class ModelProcessingEngine:
         task: TaskDefinition,
         cache_key: str,
         provider: ModelProvider,
+        task_digest: str,
+        component_hashes: dict[str, str],
+        provider_digest: str,
         model: str,
         result: dict[str, Any],
     ) -> None:
@@ -923,9 +1012,9 @@ class ModelProcessingEngine:
             result=result,
             metadata={
                 "cacheSchema": ENGINE_CACHE_SCHEMA,
-                "taskDigest": task.digest,
-                "componentHashes": task.component_hashes,
-                "providerIdentityDigest": provider.config.digest,
+                "taskDigest": task_digest,
+                "componentHashes": component_hashes,
+                "providerIdentityDigest": provider_digest,
             },
             ttl_seconds=task.cache_policy.ttl_seconds,
         )
@@ -937,12 +1026,13 @@ class ModelProcessingEngine:
         cached: CacheRecord,
         *,
         started_timer: float,
-    ) -> ResultEnvelope:
-        envelope.update(
+    ) -> ResultEnvelope | None:
+        completed = copy.deepcopy(envelope)
+        completed.update(
             {
                 "status": "succeeded",
                 "cache": {
-                    "mode": envelope["cache"]["mode"],
+                    "mode": completed["cache"]["mode"],
                     "source": "local_result",
                     "hit": True,
                     "key": cached.key,
@@ -961,7 +1051,7 @@ class ModelProcessingEngine:
                 "progress": {"event": "completed", "processed": 0},
             }
         )
-        envelope["timing"].update(
+        completed["timing"].update(
             {
                 "completedAt": _utc_now(),
                 "elapsedMs": _elapsed_ms(started_timer),
@@ -971,8 +1061,15 @@ class ModelProcessingEngine:
                 "contractRepairs": 0,
             }
         )
-        self._save_execution(task, envelope)
-        return ResultEnvelope.model_validate(envelope)
+        hit_count = self.store.save_cache_hit_execution(
+            namespace=task.namespace,
+            key=cached.key,
+            expected_created_at=cached.created_at,
+            envelope=completed,
+        )
+        if hit_count is None:
+            return None
+        return ResultEnvelope.model_validate(completed)
 
     def _save_execution(self, task: TaskDefinition, envelope: dict[str, Any]) -> None:
         if not task.cache_policy.sensitive:
@@ -991,6 +1088,8 @@ class ModelProcessingEngine:
         *,
         execution_id: str,
         status: str,
+        task_digest: str,
+        component_hashes: dict[str, str],
     ) -> dict[str, Any]:
         return {
             "schemaVersion": 1,
@@ -1000,8 +1099,8 @@ class ModelProcessingEngine:
                 "namespace": task.namespace,
                 "id": task.id,
                 "version": task.version,
-                "digest": task.digest,
-                "componentHashes": task.component_hashes,
+                "digest": task_digest,
+                "componentHashes": component_hashes,
             },
             "provider": {},
             "cache": {"mode": task.cache_policy.mode, "hit": False},
@@ -1012,6 +1111,10 @@ class ModelProcessingEngine:
             "warnings": [],
             "error": None,
         }
+
+
+def _task_fingerprints(task: TaskDefinition) -> tuple[str, dict[str, str]]:
+    return task.digest, task.component_hashes
 
 
 def validate_instance(value: Any, schema: dict[str, Any], *, label: str) -> None:

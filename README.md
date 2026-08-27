@@ -232,6 +232,11 @@ repairs are separate counters. A repair reuses the original task/input prefix,
 adds the rejected object plus a bounded validation diagnostic, and is recorded
 as another real Provider call.
 
+Batch tasks use a bounded sliding worker window and allow at most 1,000 chunks
+per execution. Requests above that limit fail before any Provider call; increase
+`batchPolicy.chunkSize` or split the request. Chunk results are always merged in
+input order even when Provider calls finish out of order.
+
 Sensitive tasks must execute synchronously. Their result is returned to that
 caller but omitted from persistent execution records as well as the result
 cache.

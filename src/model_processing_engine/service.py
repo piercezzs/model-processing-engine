@@ -245,6 +245,7 @@ def create_app(
         model: str | None,
         created_from: float | None,
         created_to: float | None,
+        include_summary: bool,
     ) -> dict[str, Any]:
         return task_engine.store.execution_history(
             limit=limit,
@@ -257,6 +258,7 @@ def create_app(
             model=model,
             created_from=created_from,
             created_to=created_to,
+            include_summary=include_summary,
         )
 
     @app.get(f"/{API_VERSION}/admin/executions")
@@ -278,6 +280,7 @@ def create_app(
         model: str | None = Query(default=None, max_length=256),
         created_from: float | None = Query(default=None, alias="createdFrom"),
         created_to: float | None = Query(default=None, alias="createdTo"),
+        include_summary: bool = Query(default=True, alias="includeSummary"),
     ) -> dict[str, Any]:
         return history_payload(
             limit=limit,
@@ -290,6 +293,7 @@ def create_app(
             model=model,
             created_from=created_from,
             created_to=created_to,
+            include_summary=include_summary,
         )
 
     @app.get(f"/{API_VERSION}/admin/execution-stats")
