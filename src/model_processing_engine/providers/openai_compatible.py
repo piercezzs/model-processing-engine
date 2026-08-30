@@ -7,7 +7,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from model_processing_engine.exceptions import (
     ConfigurationError,
@@ -15,10 +15,18 @@ from model_processing_engine.exceptions import (
     ProviderError,
 )
 
-from .base import ProviderCallResult, ProviderConfig
+from .base import (
+    ProviderCallResult,
+    ProviderConfig,
+    ProviderTextCompleted,
+    ProviderTextDelta,
+    ProviderTextEvent,
+    ProviderTextResult,
+)
 
 
 MAX_PROVIDER_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_PROVIDER_STREAM_LINE_BYTES = 1024 * 1024
 
 
 class OpenAICompatibleProvider:
@@ -142,6 +150,174 @@ class OpenAICompatibleProvider:
             attempts=attempts,
             elapsed_ms=elapsed_ms,
         )
+
+    def stream_text(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        input_payload: dict[str, Any],
+        temperature: float,
+        max_tokens: int | None,
+        repair_feedback: str | None = None,
+        previous_output: str | None = None,
+    ) -> Iterator[ProviderTextEvent]:
+        api_key = self._credential_resolver(self.config.api_key_env).strip()
+        if not self.config.api_key_env or not api_key:
+            raise ConfigurationError(
+                f"Missing provider credential environment variable: {self.config.api_key_env or '<unset>'}"
+            )
+        resolved_model = (model or self.config.default_model).strip()
+        if not resolved_model:
+            raise ConfigurationError(f"Provider {self.config.id} requires a model")
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(input_payload, ensure_ascii=False)},
+        ]
+        if repair_feedback:
+            if previous_output is not None:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": _bounded_text(previous_output, maximum=50_000),
+                    }
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous plain-text answer failed the declared output contract. "
+                        f"Validation error: {_preview(repair_feedback)}. "
+                        "Return one corrected plain-text answer only, with no JSON wrapper."
+                    ),
+                }
+            )
+        payload: dict[str, Any] = {
+            "model": resolved_model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        request = urllib.request.Request(
+            self._url(),
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "User-Agent": "model-processing-engine/0.1",
+            },
+            method="POST",
+        )
+        started = time.perf_counter()
+        maximum_attempts = self.config.transport_retries + 1
+        last_error: Exception | None = None
+        for attempt in range(1, maximum_attempts + 1):
+            emitted_content = False
+            text_parts: list[str] = []
+            usage = _normalize_usage(None)
+            try:
+                with _open_without_redirects(
+                    request,
+                    timeout=self.config.timeout_seconds,
+                ) as response:
+                    for data in _iter_sse_data(response, attempt=attempt):
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event_payload = json.loads(data)
+                        except json.JSONDecodeError as exc:
+                            raise ProviderError(
+                                f"Provider returned invalid SSE JSON: {_preview(data)}",
+                                attempts=attempt,
+                                audit_message="Provider returned invalid SSE JSON",
+                            ) from exc
+                        if not isinstance(event_payload, dict):
+                            raise ProviderError(
+                                "Provider SSE data is not a JSON object",
+                                attempts=attempt,
+                                audit_message="Provider SSE data is not a JSON object",
+                            )
+                        if isinstance(event_payload.get("error"), dict):
+                            error_value = event_payload["error"]
+                            raise ProviderError(
+                                f"Provider stream failed: {_preview(str(error_value.get('message') or 'unknown error'))}",
+                                attempts=attempt,
+                                audit_message="Provider stream returned an error event",
+                            )
+                        if event_payload.get("usage") is not None:
+                            usage = _normalize_usage(event_payload.get("usage"))
+                        delta = _stream_delta_content(event_payload)
+                        if delta:
+                            emitted_content = True
+                            text_parts.append(delta)
+                            yield ProviderTextDelta(delta)
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = _read_provider_body(
+                        exc,
+                        attempt=attempt,
+                        decode_errors="replace",
+                    )
+                finally:
+                    exc.close()
+                if not emitted_content and (exc.code == 429 or 500 <= exc.code < 600):
+                    last_error = exc
+                    if attempt < maximum_attempts:
+                        time.sleep(0.1 * attempt)
+                        continue
+                raise ProviderError(
+                    f"Provider request failed with HTTP {exc.code}: {_preview(body)}",
+                    attempts=attempt,
+                    elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+                    audit_message=f"Provider request failed with HTTP {exc.code}",
+                ) from exc
+            except ProviderError as exc:
+                raise _provider_call_error(
+                    exc,
+                    usage=exc.usage or usage,
+                    attempts=exc.attempts or attempt,
+                    elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+                ) from exc
+            except _retryable_errors() as exc:
+                last_error = exc
+                if not emitted_content and attempt < maximum_attempts:
+                    time.sleep(0.1 * attempt)
+                    continue
+                raise ProviderError(
+                    "Provider stream transport failed"
+                    + (" after content was emitted" if emitted_content else ""),
+                    attempts=attempt,
+                    elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+                    audit_message="Provider stream transport failed",
+                ) from exc
+            text = "".join(text_parts)
+            elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
+            if not text:
+                raise ProviderEmptyContentError(
+                    "Provider response content is empty",
+                    usage=usage,
+                    attempts=attempt,
+                    elapsed_ms=elapsed_ms,
+                )
+            yield ProviderTextCompleted(
+                ProviderTextResult(
+                    text=text,
+                    usage=usage,
+                    attempts=attempt,
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+            return
+        raise ProviderError(
+            f"Provider stream transport failed after {maximum_attempts} attempts: "
+            f"{last_error.__class__.__name__ if last_error else 'unknown error'}",
+            attempts=maximum_attempts,
+            elapsed_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            audit_message="Provider stream transport failed",
+        ) from last_error
 
     def list_models(self, *, models_path: str = "/models") -> dict[str, Any]:
         api_key = self._credential_resolver(self.config.api_key_env).strip()
@@ -270,6 +446,73 @@ def _read_provider_body(
         ) from exc
 
 
+def _iter_sse_data(response: Any, *, attempt: int) -> Iterator[str]:
+    total_bytes = 0
+    data_lines: list[str] = []
+    while True:
+        raw_line = response.readline(MAX_PROVIDER_STREAM_LINE_BYTES + 1)
+        if not raw_line:
+            if data_lines:
+                yield "\n".join(data_lines)
+            return
+        total_bytes += len(raw_line)
+        if total_bytes > MAX_PROVIDER_RESPONSE_BYTES:
+            raise ProviderError(
+                f"Provider stream exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes",
+                attempts=attempt,
+                audit_message="Provider stream exceeded the byte limit",
+            )
+        if len(raw_line) > MAX_PROVIDER_STREAM_LINE_BYTES:
+            raise ProviderError(
+                f"Provider stream line exceeded {MAX_PROVIDER_STREAM_LINE_BYTES} bytes",
+                attempts=attempt,
+                audit_message="Provider stream line exceeded the byte limit",
+            )
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProviderError(
+                "Provider stream is not valid UTF-8",
+                attempts=attempt,
+                audit_message="Provider stream is not valid UTF-8",
+            ) from exc
+        line = line.rstrip("\r\n")
+        if not line:
+            if data_lines:
+                yield "\n".join(data_lines)
+                data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line == "data":
+            data_lines.append("")
+        elif line.startswith("data:"):
+            value = line[5:]
+            data_lines.append(value[1:] if value.startswith(" ") else value)
+
+
+def _stream_delta_content(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return ""
+    content = delta.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") in {"text", "output_text"}
+    )
+
+
 def _message_content(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -375,6 +618,10 @@ def _preview(value: str) -> str:
 def _bounded_json(value: dict[str, Any], *, maximum: int) -> str:
     serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return serialized if len(serialized) <= maximum else serialized[:maximum]
+
+
+def _bounded_text(value: str, *, maximum: int) -> str:
+    return value if len(value) <= maximum else value[:maximum]
 
 
 def _provider_call_error(

@@ -20,6 +20,56 @@ from tests.helpers import engine_with_mock, execution_request, task_definition
 
 
 class ServiceAndCliTests(unittest.TestCase):
+    def test_streaming_execution_endpoint_emits_sse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, _provider = engine_with_mock(
+                root,
+                text_responder=lambda payload, _feedback: payload["input"]["text"],
+                text_chunk_size=2,
+            )
+            settings = Settings(
+                root=root,
+                provider_config_path=root / "providers.json",
+                data_dir=root,
+                host="127.0.0.1",
+                port=8787,
+                allow_remote=False,
+                max_provider_concurrency=8,
+                max_request_bytes=2 * 1024 * 1024,
+            )
+            task = task_definition(
+                cache_policy={"mode": "disabled"},
+                stream_policy={"mode": "text_field", "resultField": "reply"},
+                output_schema={
+                    "type": "object",
+                    "required": ["reply"],
+                    "properties": {"reply": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            )
+            payload = execution_request(task, {"text": "hello"}).model_dump(by_alias=True)
+
+            with TestClient(create_app(engine=engine, settings=settings)) as client:
+                response = client.post("/v1/executions/stream", json=payload)
+                invalid = client.post(
+                    "/v1/executions/stream",
+                    json=execution_request(task_definition()).model_dump(by_alias=True),
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+            self.assertEqual(response.headers["x-accel-buffering"], "no")
+            self.assertIn("event: content.delta", response.text)
+            self.assertIn("event: execution.completed", response.text)
+            data_payloads = [
+                json.loads(line[6:])
+                for line in response.text.splitlines()
+                if line.startswith("data: ")
+            ]
+            self.assertEqual(data_payloads[-1]["envelope"]["result"], {"reply": "hello"})
+            self.assertEqual(invalid.status_code, 400)
+
     def test_request_size_limit_rejects_declared_and_chunked_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

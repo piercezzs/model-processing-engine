@@ -128,10 +128,15 @@ if not errorlevel 1 (
     if errorlevel 1 exit /b !ERRORLEVEL!
 )
 
-echo [MPE] Starting the managed service
-"%VENV_PYTHON%" -m model_processing_engine.cli start
-if errorlevel 1 exit /b !ERRORLEVEL!
+if "%START_ONLY%"=="1" (
+    echo [MPE] Ensuring the managed service is running
+    "%VENV_PYTHON%" -m model_processing_engine.cli start
+    if errorlevel 1 exit /b !ERRORLEVEL!
+)
 if "%START_ONLY%"=="1" exit /b 0
+echo [MPE] Starting or restarting the managed service
+"%VENV_PYTHON%" -m model_processing_engine.cli restart
+if errorlevel 1 exit /b !ERRORLEVEL!
 "%VENV_PYTHON%" -m model_processing_engine.cli status
 if errorlevel 1 exit /b !ERRORLEVEL!
 if "%OPEN_ADMIN%"=="1" (

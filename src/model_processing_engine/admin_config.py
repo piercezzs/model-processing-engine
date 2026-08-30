@@ -327,6 +327,7 @@ class AdminConfigManager:
                 "availableModels": available_models,
                 "capabilities": [
                     "structured_json",
+                    "text_stream",
                     *(
                         ["native_json_schema"]
                         if draft.native_json_schema
@@ -444,6 +445,7 @@ class AdminConfigManager:
             available_models=(model,),
             capabilities=(
                 "structured_json",
+                "text_stream",
                 *(
                     ("native_json_schema",)
                     if draft.native_json_schema

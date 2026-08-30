@@ -14,7 +14,12 @@ from model_processing_engine.exceptions import (
     ProviderEmptyContentError,
     ProviderError,
 )
-from model_processing_engine.providers.base import ProviderConfig, ProviderRegistry
+from model_processing_engine.providers.base import (
+    ProviderConfig,
+    ProviderRegistry,
+    ProviderTextCompleted,
+    ProviderTextDelta,
+)
 from model_processing_engine.providers.openai_compatible import OpenAICompatibleProvider
 from model_processing_engine.settings import PACKAGE_PROVIDER_CONFIG, load_settings
 
@@ -35,7 +40,126 @@ class _Response:
         return self._body if size < 0 else self._body[:size]
 
 
+class _StreamResponse:
+    def __init__(self, lines: list[str]) -> None:
+        self._body = io.BytesIO("".join(lines).encode("utf-8"))
+
+    def __enter__(self) -> "_StreamResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._body.readline(size)
+
+
+class _InterruptedStreamResponse:
+    def __init__(self) -> None:
+        self._lines = iter(
+            [
+                b'data: {"choices":[{"delta":{"content":"partial"}}]}\n',
+                b"\n",
+            ]
+        )
+
+    def __enter__(self) -> "_InterruptedStreamResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def readline(self, _size: int = -1) -> bytes:
+        try:
+            return next(self._lines)
+        except StopIteration as exc:
+            raise urllib.error.URLError("interrupted") from exc
+
+
 class SettingsAndProviderTests(unittest.TestCase):
+    def test_openai_compatible_stream_does_not_retry_after_a_delta(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+                transport_retries=2,
+                capabilities=("structured_json", "text_stream"),
+            )
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=_InterruptedStreamResponse(),
+            ) as urlopen:
+                stream = provider.stream_text(
+                    model="",
+                    system_prompt="Answer plainly",
+                    input_payload={},
+                    temperature=0,
+                    max_tokens=32,
+                )
+                first = next(stream)
+                with self.assertRaises(ProviderError) as raised:
+                    next(stream)
+
+        self.assertIsInstance(first, ProviderTextDelta)
+        self.assertIn("after content was emitted", str(raised.exception))
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_openai_compatible_provider_streams_plain_text_sse(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+                capabilities=("structured_json", "text_stream"),
+            )
+        )
+        response = _StreamResponse(
+            [
+                'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+                'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+                'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n',
+                "data: [DONE]\n\n",
+            ]
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                events = list(
+                    provider.stream_text(
+                        model="",
+                        system_prompt="Answer plainly",
+                        input_payload={"input": {"text": "hello"}},
+                        temperature=0,
+                        max_tokens=32,
+                    )
+                )
+
+        self.assertEqual(
+            [event.delta for event in events if isinstance(event, ProviderTextDelta)],
+            ["hel", "lo"],
+        )
+        completed = next(
+            event.result
+            for event in events
+            if isinstance(event, ProviderTextCompleted)
+        )
+        self.assertEqual(completed.text, "hello")
+        self.assertEqual(completed.usage["totalTokens"], 5)
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertTrue(payload["stream"])
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(request.get_header("Accept"), "text/event-stream")
+
     def test_default_runtime_root_uses_mpe_home(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {"MPE_HOME": temp_dir}, clear=True):

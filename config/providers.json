@@ -8,7 +8,7 @@
       "cacheIdentity": "mock-v1",
       "maxConcurrency": 8,
       "availableModels": ["schema-sample-v1"],
-      "capabilities": ["structured_json"]
+      "capabilities": ["structured_json", "text_stream"]
     },
     "openai-compatible": {
       "type": "openai_compatible",
@@ -21,7 +21,7 @@
       "maxConcurrency": 8,
       "cacheIdentity": "account-and-endpoint-v1",
       "availableModels": [],
-      "capabilities": ["structured_json"]
+      "capabilities": ["structured_json", "text_stream"]
     }
   }
 }

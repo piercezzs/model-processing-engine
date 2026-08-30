@@ -133,11 +133,15 @@ else
     environment_is_ready || fail "The repaired environment did not pass validation"
 fi
 
-printf '[MPE] Starting the managed service\n'
-"$VENV_PYTHON" -m model_processing_engine.cli start || exit $?
+if [ "$START_ONLY" -eq 1 ]; then
+    printf '[MPE] Ensuring the managed service is running\n'
+    "$VENV_PYTHON" -m model_processing_engine.cli start || exit $?
+fi
 if [ "$START_ONLY" -eq 1 ]; then
     exit 0
 fi
+printf '[MPE] Starting or restarting the managed service\n'
+"$VENV_PYTHON" -m model_processing_engine.cli restart || exit $?
 "$VENV_PYTHON" -m model_processing_engine.cli status
 if [ "$OPEN_ADMIN" -eq 1 ]; then
     printf '[MPE] Opening the local management page\n'

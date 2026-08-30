@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 from urllib.parse import urlparse
 
 from model_processing_engine.canonical import digest_json
@@ -49,6 +49,27 @@ class ProviderCallResult:
     elapsed_ms: int
 
 
+@dataclass(frozen=True)
+class ProviderTextResult:
+    text: str
+    usage: dict[str, Any]
+    attempts: int
+    elapsed_ms: int
+
+
+@dataclass(frozen=True)
+class ProviderTextDelta:
+    delta: str
+
+
+@dataclass(frozen=True)
+class ProviderTextCompleted:
+    result: ProviderTextResult
+
+
+ProviderTextEvent = ProviderTextDelta | ProviderTextCompleted
+
+
 class ModelProvider(Protocol):
     config: ProviderConfig
 
@@ -64,6 +85,18 @@ class ModelProvider(Protocol):
         repair_feedback: str | None = None,
         previous_output: dict[str, Any] | None = None,
     ) -> ProviderCallResult: ...
+
+    def stream_text(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        input_payload: dict[str, Any],
+        temperature: float,
+        max_tokens: int | None,
+        repair_feedback: str | None = None,
+        previous_output: str | None = None,
+    ) -> Iterator[ProviderTextEvent]: ...
 
 
 ProviderFactory = Callable[[ProviderConfig], ModelProvider]

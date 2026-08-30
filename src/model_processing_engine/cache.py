@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .exceptions import AsyncQueueFullError
@@ -123,13 +123,11 @@ class SQLiteRuntimeStore:
     def get_cache(self, namespace: str, key: str) -> CacheRecord | None:
         now = time.time()
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM cache_entries WHERE namespace = ? AND cache_key = ?",
                 (namespace, key),
             ).fetchone()
             if row is None:
-                connection.commit()
                 return None
             expires_at = float(row["expires_at"]) if row["expires_at"] is not None else None
             if expires_at is not None and expires_at <= now:
@@ -137,18 +135,7 @@ class SQLiteRuntimeStore:
                     "DELETE FROM cache_entries WHERE namespace = ? AND cache_key = ?",
                     (namespace, key),
                 )
-                connection.commit()
                 return None
-            hit_count = int(row["hit_count"]) + 1
-            connection.execute(
-                """
-                UPDATE cache_entries
-                SET hit_count = ?, last_accessed_at = ?
-                WHERE namespace = ? AND cache_key = ?
-                """,
-                (hit_count, now, namespace, key),
-            )
-            connection.commit()
             return CacheRecord(
                 namespace=namespace,
                 key=key,
@@ -156,8 +143,50 @@ class SQLiteRuntimeStore:
                 metadata=_json_object(row["metadata_json"]),
                 created_at=float(row["created_at"]),
                 expires_at=expires_at,
-                hit_count=hit_count,
+                hit_count=int(row["hit_count"]),
             )
+
+    def save_cache_hit_execution(
+        self,
+        *,
+        namespace: str,
+        key: str,
+        expected_created_at: float,
+        envelope: dict[str, Any],
+    ) -> int | None:
+        """Persist one cache hit and its terminal execution in one transaction."""
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE cache_entries
+                SET hit_count = hit_count + 1, last_accessed_at = ?
+                WHERE namespace = ?
+                  AND cache_key = ?
+                  AND created_at = ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (now, namespace, key, expected_created_at, now),
+            )
+            if updated.rowcount != 1:
+                return None
+            row = connection.execute(
+                """
+                SELECT hit_count
+                FROM cache_entries
+                WHERE namespace = ? AND cache_key = ? AND created_at = ?
+                """,
+                (namespace, key, expected_created_at),
+            ).fetchone()
+            if row is None:
+                return None
+            hit_count = int(row["hit_count"])
+            cache = envelope.get("cache")
+            if isinstance(cache, dict):
+                cache["hitCount"] = hit_count
+            _upsert_execution(connection, envelope, now=now)
+            return hit_count
 
     def put_cache(
         self,
@@ -415,7 +444,7 @@ class SQLiteRuntimeStore:
             ).fetchall()
             for row in rows:
                 execution_id = str(row["execution_id"])
-                if str(row["record_status"]) in {"succeeded", "failed"}:
+                if str(row["record_status"]) in {"succeeded", "failed", "cancelled"}:
                     connection.execute(
                         "DELETE FROM async_execution_queue WHERE execution_id = ?",
                         (execution_id,),
@@ -506,6 +535,7 @@ class SQLiteRuntimeStore:
         model: str | None = None,
         created_from: float | None = None,
         created_to: float | None = None,
+        include_summary: bool = True,
     ) -> dict[str, Any]:
         clauses: list[str] = []
         parameters: list[Any] = []
@@ -550,37 +580,34 @@ class SQLiteRuntimeStore:
                 """,
                 (*parameters, bounded_limit, bounded_offset),
             ).fetchall()
-            aggregate_rows = connection.execute(
-                f"""
-                SELECT execution_id, envelope_json, created_at
-                FROM execution_records{where}
-                """,
-                tuple(parameters),
-            ).fetchall()
             provider_calls = _provider_calls_by_execution(
                 connection,
-                [str(row["execution_id"]) for row in aggregate_rows],
+                [str(row["execution_id"]) for row in page_rows],
             )
-        items = [
-            _execution_summary(
-                _json_object(row["envelope_json"]),
-                provider_calls.get(str(row["execution_id"]), []),
-                recorded_at=float(row["created_at"]),
-            )
-            for row in page_rows
-        ]
-        aggregate_items = [
-            _execution_summary(
-                _json_object(row["envelope_json"]),
-                provider_calls.get(str(row["execution_id"]), []),
-                recorded_at=float(row["created_at"]),
-            )
-            for row in aggregate_rows
-        ]
+            items = [
+                _execution_summary(
+                    _json_object(row["envelope_json"]),
+                    provider_calls.get(str(row["execution_id"]), []),
+                    recorded_at=float(row["created_at"]),
+                )
+                for row in page_rows
+            ]
+            summary = None
+            if include_summary:
+                summary_cursor = connection.execute(
+                    f"""
+                    SELECT execution_id, envelope_json, created_at
+                    FROM execution_records{where}
+                    """,
+                    tuple(parameters),
+                )
+                summary = _execution_aggregate(
+                    _iter_execution_summaries(connection, summary_cursor)
+                )
         total = int(total_row["count"] if total_row else 0)
-        return {
+        payload = {
             "items": items,
-            "summary": _execution_aggregate(aggregate_items),
+            "summary": summary,
             "pagination": {
                 "limit": bounded_limit,
                 "offset": bounded_offset,
@@ -588,6 +615,7 @@ class SQLiteRuntimeStore:
                 "hasMore": bounded_offset + len(items) < total,
             },
         }
+        return payload
 
     def execution_statistics(
         self,
@@ -603,48 +631,63 @@ class SQLiteRuntimeStore:
         model: str | None = None,
     ) -> dict[str, Any]:
         window = _period_window(period, anchor, timezone_name)
-        clauses = ["created_at >= ?", "created_at < ?"]
-        parameters: list[Any] = [window["startTimestamp"], window["endTimestamp"]]
+        base_clauses = ["created_at >= ?", "created_at < ?"]
+        base_parameters: list[Any] = [
+            window["startTimestamp"],
+            window["endTimestamp"],
+        ]
         if namespace:
-            clauses.append("namespace = ?")
-            parameters.append(namespace)
+            base_clauses.append("namespace = ?")
+            base_parameters.append(namespace)
         if task_id:
-            clauses.append("task_id = ?")
-            parameters.append(task_id)
+            base_clauses.append("task_id = ?")
+            base_parameters.append(task_id)
         if status:
-            clauses.append("status = ?")
-            parameters.append(status)
+            base_clauses.append("status = ?")
+            base_parameters.append(status)
         if kind:
-            clauses.append("kind = ?")
-            parameters.append(kind)
-        where = f" WHERE {' AND '.join(clauses)}"
+            base_clauses.append("kind = ?")
+            base_parameters.append(kind)
+        filtered_clauses = list(base_clauses)
+        filtered_parameters = list(base_parameters)
+        if provider_id:
+            filtered_clauses.append("provider_id = ?")
+            filtered_parameters.append(provider_id)
+        if model:
+            filtered_clauses.append("model = ?")
+            filtered_parameters.append(model)
+        base_where = f" WHERE {' AND '.join(base_clauses)}"
+        filtered_where = f" WHERE {' AND '.join(filtered_clauses)}"
         with self._connect() as connection:
-            rows = connection.execute(
+            cursor = connection.execute(
                 f"""
                 SELECT execution_id, envelope_json, created_at
-                FROM execution_records{where}
+                FROM execution_records{filtered_where}
                 ORDER BY created_at, execution_id
                 """,
-                tuple(parameters),
-            ).fetchall()
-            provider_calls = _provider_calls_by_execution(
-                connection,
-                [str(row["execution_id"]) for row in rows],
+                tuple(filtered_parameters),
             )
-        base_items = [
-            _execution_summary(
-                _json_object(row["envelope_json"]),
-                provider_calls.get(str(row["execution_id"]), []),
-                recorded_at=float(row["created_at"]),
+            summary, series, models = _execution_statistics_components(
+                _iter_execution_summaries(connection, cursor),
+                window=window,
             )
-            for row in rows
-        ]
-        items = [
-            item
-            for item in base_items
-            if (not provider_id or item["provider"]["id"] == provider_id)
-            and (not model or item["provider"]["model"] == model)
-        ]
+            facet_rows = connection.execute(
+                f"""
+                SELECT DISTINCT provider_id, model
+                FROM execution_records{base_where}
+                ORDER BY provider_id, model
+                """,
+                tuple(base_parameters),
+            )
+            facets = _execution_facets(
+                {
+                    "provider": {
+                        "id": str(row["provider_id"]),
+                        "model": str(row["model"]),
+                    }
+                }
+                for row in facet_rows
+            )
         return {
             "period": {
                 "kind": period,
@@ -653,10 +696,10 @@ class SQLiteRuntimeStore:
                 "start": window["start"].isoformat(),
                 "end": window["end"].isoformat(),
             },
-            "summary": _execution_aggregate(items),
-            "series": _execution_series(items, window=window),
-            "models": _execution_model_breakdown(items),
-            "facets": _execution_facets(base_items),
+            "summary": summary,
+            "series": series,
+            "models": models,
+            "facets": facets,
         }
 
     def recover_incomplete_executions(self) -> int:
@@ -900,66 +943,113 @@ def _execution_summary(
     }
 
 
-def _execution_aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
-    statuses = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0}
-    usage_fields = (
-        "inputTokens",
-        "outputTokens",
-        "totalTokens",
-        "cacheReadInputTokens",
-    )
-    usage = {field: 0 for field in usage_fields}
-    usage_available = 0
-    cache_hits = 0
-    provider_cache_hit_executions = 0
-    provider_calls = 0
-    transport_retries = 0
-    contract_repairs = 0
-    provider_tests = 0
-    elapsed_total = 0
-    elapsed_available = 0
-    for item in items:
-        status = item.get("status")
-        if status in statuses:
-            statuses[status] += 1
-        if item.get("kind") == "provider_test":
-            provider_tests += 1
-        cache_hits += int(bool(item.get("cache", {}).get("hit")))
-        item_usage = item.get("usage", {})
-        usage_available += int(bool(item_usage.get("available")))
-        provider_cache_hit_executions += int(
-            _non_negative_int(item_usage.get("cacheReadInputTokens")) > 0
+def _iter_execution_summaries(
+    connection: sqlite3.Connection,
+    cursor: sqlite3.Cursor,
+    *,
+    batch_size: int = 100,
+) -> Iterator[dict[str, Any]]:
+    while rows := cursor.fetchmany(batch_size):
+        provider_calls = _provider_calls_by_execution(
+            connection,
+            [str(row["execution_id"]) for row in rows],
         )
-        for field in usage_fields:
-            usage[field] += _non_negative_int(item_usage.get(field))
-        timing = item.get("timing", {})
-        provider_calls += _non_negative_int(timing.get("providerCallCount"))
-        transport_retries += _non_negative_int(timing.get("transportRetries"))
-        contract_repairs += _non_negative_int(timing.get("contractRepairs"))
-        elapsed_ms = _non_negative_int(timing.get("elapsedMs"))
-        if elapsed_ms:
-            elapsed_total += elapsed_ms
-            elapsed_available += 1
-    terminal = statuses["succeeded"] + statuses["failed"]
+        for row in rows:
+            execution_id = str(row["execution_id"])
+            yield _execution_summary(
+                _json_object(row["envelope_json"]),
+                provider_calls.get(execution_id, []),
+                recorded_at=float(row["created_at"]),
+            )
+
+
+def _new_execution_aggregate_state() -> dict[str, Any]:
     return {
-        "total": len(items),
+        "total": 0,
+        "statuses": {
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+        },
+        "usage": {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "totalTokens": 0,
+            "cacheReadInputTokens": 0,
+        },
+        "usageAvailable": 0,
+        "cacheHits": 0,
+        "providerCacheHitExecutions": 0,
+        "providerCalls": 0,
+        "transportRetries": 0,
+        "contractRepairs": 0,
+        "providerTests": 0,
+        "elapsedTotal": 0,
+        "elapsedAvailable": 0,
+    }
+
+
+def _update_execution_aggregate_state(
+    state: dict[str, Any],
+    item: dict[str, Any],
+) -> None:
+    state["total"] += 1
+    statuses = state["statuses"]
+    status = item.get("status")
+    if status in statuses:
+        statuses[status] += 1
+    if item.get("kind") == "provider_test":
+        state["providerTests"] += 1
+    state["cacheHits"] += int(bool(item.get("cache", {}).get("hit")))
+    item_usage = item.get("usage", {})
+    state["usageAvailable"] += int(bool(item_usage.get("available")))
+    state["providerCacheHitExecutions"] += int(
+        _non_negative_int(item_usage.get("cacheReadInputTokens")) > 0
+    )
+    for field in state["usage"]:
+        state["usage"][field] += _non_negative_int(item_usage.get(field))
+    timing = item.get("timing", {})
+    state["providerCalls"] += _non_negative_int(timing.get("providerCallCount"))
+    state["transportRetries"] += _non_negative_int(timing.get("transportRetries"))
+    state["contractRepairs"] += _non_negative_int(timing.get("contractRepairs"))
+    elapsed_ms = _non_negative_int(timing.get("elapsedMs"))
+    if elapsed_ms:
+        state["elapsedTotal"] += elapsed_ms
+        state["elapsedAvailable"] += 1
+
+
+def _finish_execution_aggregate_state(state: dict[str, Any]) -> dict[str, Any]:
+    statuses = state["statuses"]
+    terminal = statuses["succeeded"] + statuses["failed"]
+    elapsed_available = state["elapsedAvailable"]
+    return {
+        "total": state["total"],
         **statuses,
         "successRate": round(
             statuses["succeeded"] / terminal * 100,
             1,
         ) if terminal else 0.0,
-        "providerTests": provider_tests,
-        "cacheHits": cache_hits,
-        "providerCacheHitExecutions": provider_cache_hit_executions,
-        "providerCallCount": provider_calls,
-        "transportRetries": transport_retries,
-        "contractRepairs": contract_repairs,
+        "providerTests": state["providerTests"],
+        "cacheHits": state["cacheHits"],
+        "providerCacheHitExecutions": state["providerCacheHitExecutions"],
+        "providerCallCount": state["providerCalls"],
+        "transportRetries": state["transportRetries"],
+        "contractRepairs": state["contractRepairs"],
         "averageElapsedMs": round(
-            elapsed_total / elapsed_available,
+            state["elapsedTotal"] / elapsed_available,
         ) if elapsed_available else 0,
-        "usageAvailableExecutions": usage_available,
-        "usage": usage,
+        "usageAvailableExecutions": state["usageAvailable"],
+        "usage": state["usage"],
     }
+
+
+def _execution_aggregate(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    state = _new_execution_aggregate_state()
+    for item in items:
+        _update_execution_aggregate_state(state, item)
+    return _finish_execution_aggregate_state(state)
 
 
 def _timestamp_iso(value: float | None) -> str:
@@ -1032,15 +1122,10 @@ def _execution_datetime(
     return parsed.astimezone(local_zone)
 
 
-def _execution_series(
-    items: list[dict[str, Any]],
-    *,
-    window: dict[str, Any],
-) -> list[dict[str, Any]]:
+def _new_execution_series(window: dict[str, Any]) -> list[dict[str, Any]]:
     period = str(window["period"])
     start = window["start"]
     end = window["end"]
-    local_zone = window["timezone"]
     buckets: list[dict[str, Any]] = []
     if period == "day":
         for hour in range(24):
@@ -1051,12 +1136,12 @@ def _execution_series(
                     "executions": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "cancelled": 0,
                     "providerCalls": 0,
                     "totalTokens": 0,
                     "cacheReadInputTokens": 0,
                 }
             )
-        key_for = lambda value: value.hour
     elif period == "month":
         day_count = (end.date() - start.date()).days
         for day in range(1, day_count + 1):
@@ -1067,12 +1152,12 @@ def _execution_series(
                     "executions": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "cancelled": 0,
                     "providerCalls": 0,
                     "totalTokens": 0,
                     "cacheReadInputTokens": 0,
                 }
             )
-        key_for = lambda value: value.day - 1
     else:
         for month in range(1, 13):
             buckets.append(
@@ -1082,82 +1167,106 @@ def _execution_series(
                     "executions": 0,
                     "succeeded": 0,
                     "failed": 0,
+                    "cancelled": 0,
                     "providerCalls": 0,
                     "totalTokens": 0,
                     "cacheReadInputTokens": 0,
                 }
             )
-        key_for = lambda value: value.month - 1
-
-    for item in items:
-        local_time = _execution_datetime(item, local_zone)
-        if local_time is None:
-            continue
-        index = key_for(local_time)
-        if not 0 <= index < len(buckets):
-            continue
-        bucket = buckets[index]
-        bucket["executions"] += 1
-        status = item.get("status")
-        if status in {"succeeded", "failed"}:
-            bucket[status] += 1
-        timing = item.get("timing", {})
-        usage = item.get("usage", {})
-        bucket["providerCalls"] += _non_negative_int(
-            timing.get("providerCallCount")
-        )
-        bucket["totalTokens"] += _non_negative_int(usage.get("totalTokens"))
-        bucket["cacheReadInputTokens"] += _non_negative_int(
-            usage.get("cacheReadInputTokens")
-        )
     return buckets
 
 
-def _execution_model_breakdown(
-    items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in items:
-        provider = item.get("provider", {})
-        key = (
-            str(provider.get("id") or "unknown"),
-            str(provider.get("model") or "unknown"),
-        )
-        group = groups.setdefault(
-            key,
-            {
-                "providerId": key[0],
-                "model": key[1],
-                "executions": 0,
-                "succeeded": 0,
-                "failed": 0,
-                "providerCalls": 0,
-                "elapsedMs": 0,
-                "elapsedAvailable": 0,
-                "usage": {
-                    "inputTokens": 0,
-                    "outputTokens": 0,
-                    "totalTokens": 0,
-                    "cacheReadInputTokens": 0,
-                },
-            },
-        )
-        group["executions"] += 1
-        status = item.get("status")
-        if status in {"succeeded", "failed"}:
-            group[status] += 1
-        timing = item.get("timing", {})
-        group["providerCalls"] += _non_negative_int(
-            timing.get("providerCallCount")
-        )
-        elapsed_ms = _non_negative_int(timing.get("elapsedMs"))
-        if elapsed_ms:
-            group["elapsedMs"] += elapsed_ms
-            group["elapsedAvailable"] += 1
-        usage = item.get("usage", {})
-        for field in group["usage"]:
-            group["usage"][field] += _non_negative_int(usage.get(field))
+def _update_execution_series(
+    buckets: list[dict[str, Any]],
+    *,
+    window: dict[str, Any],
+    item: dict[str, Any],
+) -> None:
+    local_time = _execution_datetime(item, window["timezone"])
+    if local_time is None:
+        return
+    period = str(window["period"])
+    if period == "day":
+        index = local_time.hour
+    elif period == "month":
+        index = local_time.day - 1
+    else:
+        index = local_time.month - 1
+    if not 0 <= index < len(buckets):
+        return
+    bucket = buckets[index]
+    bucket["executions"] += 1
+    status = item.get("status")
+    if status in {"succeeded", "failed", "cancelled"}:
+        bucket[status] += 1
+    timing = item.get("timing", {})
+    usage = item.get("usage", {})
+    bucket["providerCalls"] += _non_negative_int(timing.get("providerCallCount"))
+    bucket["totalTokens"] += _non_negative_int(usage.get("totalTokens"))
+    bucket["cacheReadInputTokens"] += _non_negative_int(
+        usage.get("cacheReadInputTokens")
+    )
 
+
+def _execution_series(
+    items: Iterable[dict[str, Any]],
+    *,
+    window: dict[str, Any],
+) -> list[dict[str, Any]]:
+    buckets = _new_execution_series(window)
+
+    for item in items:
+        _update_execution_series(buckets, window=window, item=item)
+    return buckets
+
+
+def _update_execution_model_groups(
+    groups: dict[tuple[str, str], dict[str, Any]],
+    item: dict[str, Any],
+) -> None:
+    provider = item.get("provider", {})
+    key = (
+        str(provider.get("id") or "unknown"),
+        str(provider.get("model") or "unknown"),
+    )
+    group = groups.setdefault(
+        key,
+        {
+            "providerId": key[0],
+            "model": key[1],
+            "executions": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "providerCalls": 0,
+            "elapsedMs": 0,
+            "elapsedAvailable": 0,
+            "usage": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "cacheReadInputTokens": 0,
+            },
+        },
+    )
+    group["executions"] += 1
+    status = item.get("status")
+    if status in {"succeeded", "failed", "cancelled"}:
+        group[status] += 1
+    timing = item.get("timing", {})
+    group["providerCalls"] += _non_negative_int(timing.get("providerCallCount"))
+    elapsed_ms = _non_negative_int(timing.get("elapsedMs"))
+    if elapsed_ms:
+        group["elapsedMs"] += elapsed_ms
+        group["elapsedAvailable"] += 1
+    usage = item.get("usage", {})
+    for field in group["usage"]:
+        group["usage"][field] += _non_negative_int(usage.get(field))
+
+
+def _finish_execution_model_groups(
+    groups: dict[tuple[str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for group in groups.values():
         terminal = group["succeeded"] + group["failed"]
@@ -1168,6 +1277,7 @@ def _execution_model_breakdown(
                 "executions": group["executions"],
                 "succeeded": group["succeeded"],
                 "failed": group["failed"],
+                "cancelled": group["cancelled"],
                 "providerCalls": group["providerCalls"],
                 "successRate": round(
                     group["succeeded"] / terminal * 100,
@@ -1190,7 +1300,35 @@ def _execution_model_breakdown(
     )
 
 
-def _execution_facets(items: list[dict[str, Any]]) -> dict[str, Any]:
+def _execution_model_breakdown(
+    items: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        _update_execution_model_groups(groups, item)
+    return _finish_execution_model_groups(groups)
+
+
+def _execution_statistics_components(
+    items: Iterable[dict[str, Any]],
+    *,
+    window: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    aggregate_state = _new_execution_aggregate_state()
+    series = _new_execution_series(window)
+    model_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        _update_execution_aggregate_state(aggregate_state, item)
+        _update_execution_series(series, window=window, item=item)
+        _update_execution_model_groups(model_groups, item)
+    return (
+        _finish_execution_aggregate_state(aggregate_state),
+        series,
+        _finish_execution_model_groups(model_groups),
+    )
+
+
+def _execution_facets(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
     providers: dict[str, set[str]] = {}
     for item in items:
         provider = item.get("provider", {})

@@ -45,6 +45,54 @@ class ContractAndLoaderTests(unittest.TestCase):
                 }
             )
 
+    def test_text_stream_requires_disabled_cache_and_string_result_field(self) -> None:
+        with self.assertRaises(ValidationError):
+            task_definition(
+                stream_policy={"mode": "text_field", "resultField": "reply"},
+            )
+        with self.assertRaises(ValidationError):
+            task_definition(
+                cache_policy={"mode": "disabled"},
+                stream_policy={"mode": "text_field", "resultField": "reply"},
+                output_schema={
+                    "type": "object",
+                    "required": ["reply"],
+                    "properties": {"reply": {"type": "number"}},
+                },
+            )
+
+    def test_text_stream_rejects_async_mode_and_other_required_fields(self) -> None:
+        with self.assertRaises(ValidationError):
+            task_definition(
+                cache_policy={"mode": "disabled"},
+                stream_policy={"mode": "text_field", "resultField": "reply"},
+                output_schema={
+                    "type": "object",
+                    "required": ["reply", "title"],
+                    "properties": {
+                        "reply": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                },
+            )
+        task = task_definition(
+            cache_policy={"mode": "disabled"},
+            stream_policy={"mode": "text_field", "resultField": "reply"},
+            output_schema={
+                "type": "object",
+                "required": ["reply"],
+                "properties": {"reply": {"type": "string"}},
+            },
+        )
+        with self.assertRaises(ValidationError):
+            ExecutionRequest.model_validate(
+                {
+                    "task": task.model_dump(by_alias=True),
+                    "input": {"text": "hello"},
+                    "asyncMode": True,
+                }
+            )
+
     def test_load_task_pack_and_hash_components(self) -> None:
         task = load_task_pack(Path(__file__).parents[1] / "examples" / "tasks" / "generic_summary")
         self.assertEqual(task.namespace, "example-project")

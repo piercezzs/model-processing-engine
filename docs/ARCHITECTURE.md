@@ -63,6 +63,29 @@ Sensitive tasks are synchronous only. Their result is returned in memory to the
 active caller and omitted from both cache entries and persisted execution
 records.
 
+## Streaming Execution Boundary
+
+Streaming is an explicit Task contract, not a request-time switch. Version 1
+supports `streamPolicy.mode=text_field`: the Provider emits plain text, the
+engine forwards tentative deltas, then constructs one object using the declared
+`resultField` and validates it with the caller-owned output schema. The mode is
+single-item, synchronous, and cache-disabled so partial or repaired attempts can
+never become reusable results.
+
+The event sequence separates visibility from authority. `content.delta` is
+tentative UI material; `content.reset` revokes every delta from the preceding
+attempt; only `execution.completed` carries the canonical successful envelope.
+Contract repair remains bounded and every attempt has a distinct audited
+Provider-call row. Provider transport may retry only before the first delta.
+After any visible delta, an interrupted transport fails terminally rather than
+risk duplicating text.
+
+The HTTP service uses SSE as the loopback transport while the engine and
+Provider layers expose typed synchronous iterators. Closing the consumer
+iterator closes the active Provider stream, records the execution as
+`cancelled`, and omits partial content from the result. Sensitive-record rules
+still apply to a normally completed stream.
+
 Each data directory has one service-process owner. The HTTP service stores every
 asynchronous request and its queued execution envelope in one SQLite transaction.
 A bounded fixed worker pool claims queued rows; startup moves interrupted running
@@ -161,6 +184,13 @@ larger workloads can fill the configured limit, and excess calls wait without
 forcing the caller to coordinate with other projects using the same MPE
 process. Concurrency settings do not participate in cache identity because they
 change scheduling, not model semantics.
+
+Batch scheduling uses a sliding Future window bounded by the effective Provider
+limit and Task Pack concurrency. It slices each chunk only when submitted,
+preserves the original input-field order, and merges completed chunks by index.
+An execution is limited to 1,000 chunks so caller-controlled inputs cannot create
+unbounded Future queues or Provider-call cost; over-limit requests fail before
+submission and callers must increase chunk size or split the request.
 
 The asynchronous worker count bounds how many execution envelopes may be active
 at once; Provider semaphores remain the final upstream concurrency ceiling.
