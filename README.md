@@ -78,6 +78,12 @@ Run the non-starting readiness check after setup with
 Windows. Stop the verified managed service with `./stop_mpe.command` or
 `stop_mpe.bat`.
 
+Repository-owned lifecycle controllers can use `--status-only` for a lightweight
+service-state query that skips dependency validation. They can combine
+`--start-only --no-open` to reuse environment preparation and perform an
+idempotent managed start without opening the admin page or emitting a second
+status result.
+
 Normal one-click startup opens the loopback management page at `/admin` after
 verified health. Use `--no-open` to start without opening a browser. The
 management page is disabled for remote bindings.

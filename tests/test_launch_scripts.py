@@ -17,6 +17,8 @@ class LaunchScriptContractTest(unittest.TestCase):
 
         for content in (mac, windows):
             self.assertIn("--check-only", content)
+            self.assertIn("--status-only", content)
+            self.assertIn("--start-only", content)
             self.assertIn("--no-open", content)
             self.assertIn("MPE_PROJECT_DIR", content)
             self.assertIn("pyproject.toml", content)
@@ -27,6 +29,32 @@ class LaunchScriptContractTest(unittest.TestCase):
             self.assertIn("model_processing_engine.cli status", content)
             self.assertIn("model_processing_engine.cli admin", content)
             self.assertIn("sys.version_info >= (3, 10)", content)
+
+    def test_delegated_lifecycle_modes_are_lightweight(self) -> None:
+        mac = self._read("start_mpe.command")
+        windows = self._read("start_mpe.bat")
+
+        mac_status = mac.split('if [ "$STATUS_ONLY" -eq 1 ]; then', 1)[1].split(
+            'if [ "$CHECK_ONLY" -eq 1 ]; then', 1
+        )[0]
+        windows_status = windows.split('if "%STATUS_ONLY%"=="1" (', 1)[1].split(
+            'if "%CHECK_ONLY%"=="1" (', 1
+        )[0]
+        for block in (mac_status, windows_status):
+            self.assertIn("model_processing_engine.cli status", block)
+            self.assertNotIn("pip check", block)
+            self.assertNotIn("pip install", block)
+
+        mac_start = mac.split("model_processing_engine.cli start", 1)[1]
+        windows_start = windows.split("model_processing_engine.cli start", 1)[1]
+        self.assertLess(
+            mac_start.index('if [ "$START_ONLY" -eq 1 ]; then'),
+            mac_start.index("model_processing_engine.cli status"),
+        )
+        self.assertLess(
+            windows_start.index('if "%START_ONLY%"=="1" exit /b 0'),
+            windows_start.index("model_processing_engine.cli status"),
+        )
 
     def test_launchers_delegate_process_identity_to_mpe(self) -> None:
         scripts = [

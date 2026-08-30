@@ -9,6 +9,8 @@ set "VENV_DIR=%SCRIPT_DIR%\.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "DEPENDENCY_STAMP=%VENV_DIR%\.mpe-pyproject.sha256"
 set "CHECK_ONLY=0"
+set "STATUS_ONLY=0"
+set "START_ONLY=0"
 set "OPEN_ADMIN=1"
 set "MPE_PROJECT_DIR=%SCRIPT_DIR%"
 
@@ -20,19 +22,46 @@ if /I "%~1"=="--check-only" (
     shift
     goto parse_arguments
 )
+if /I "%~1"=="--status-only" (
+    set "STATUS_ONLY=1"
+    set "OPEN_ADMIN=0"
+    shift
+    goto parse_arguments
+)
+if /I "%~1"=="--start-only" (
+    set "START_ONLY=1"
+    set "OPEN_ADMIN=0"
+    shift
+    goto parse_arguments
+)
 if /I "%~1"=="--no-open" (
     set "OPEN_ADMIN=0"
     shift
     goto parse_arguments
 )
-call :fail "Usage: start_mpe.bat [--check-only] [--no-open]"
+call :fail "Usage: start_mpe.bat [--check-only | --status-only | --start-only] [--no-open]"
 exit /b 1
 
 :arguments_done
 
+set /a "MODE_COUNT=CHECK_ONLY+STATUS_ONLY+START_ONLY"
+if !MODE_COUNT! GTR 1 (
+    call :fail "Use only one of --check-only, --status-only, or --start-only"
+    exit /b 1
+)
+
 if not exist "%SCRIPT_DIR%\pyproject.toml" (
     call :fail "pyproject.toml is missing from %SCRIPT_DIR%"
     exit /b 1
+)
+
+if "%STATUS_ONLY%"=="1" (
+    if not exist "%VENV_PYTHON%" (
+        call :fail "The local environment is not ready. Run start_mpe.bat once to repair it."
+        exit /b 1
+    )
+    "%VENV_PYTHON%" -m model_processing_engine.cli status
+    exit /b !ERRORLEVEL!
 )
 
 if "%CHECK_ONLY%"=="1" (
@@ -102,6 +131,7 @@ if not errorlevel 1 (
 echo [MPE] Starting the managed service
 "%VENV_PYTHON%" -m model_processing_engine.cli start
 if errorlevel 1 exit /b !ERRORLEVEL!
+if "%START_ONLY%"=="1" exit /b 0
 "%VENV_PYTHON%" -m model_processing_engine.cli status
 if errorlevel 1 exit /b !ERRORLEVEL!
 if "%OPEN_ADMIN%"=="1" (
