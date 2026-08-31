@@ -24,6 +24,7 @@ from .exceptions import (
     ContractValidationError,
     ExecutionNotFoundError,
     ProviderError,
+    ProviderNonJsonContentError,
 )
 from .providers.base import (
     ModelProvider,
@@ -735,21 +736,43 @@ class ModelProcessingEngine:
     ) -> tuple[ProviderCallResult, list[ProviderCallResult]]:
         calls: list[ProviderCallResult] = []
         repair_feedback: str | None = None
-        previous_output: dict[str, Any] | None = None
+        previous_output: dict[str, Any] | str | None = None
         for repair_attempt in range(contract_retries + 1):
-            call = self._provider_call(
-                execution_id=execution_id,
-                sequence=sequence_start + repair_attempt,
-                purpose="task" if repair_attempt == 0 else "contract_repair",
-                task=task,
-                input_payload=input_payload,
-                provider=provider,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                repair_feedback=repair_feedback,
-                previous_output=previous_output,
-            )
+            try:
+                call = self._provider_call(
+                    execution_id=execution_id,
+                    sequence=sequence_start + repair_attempt,
+                    purpose="task" if repair_attempt == 0 else "contract_repair",
+                    task=task,
+                    input_payload=input_payload,
+                    provider=provider,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    repair_feedback=repair_feedback,
+                    previous_output=previous_output,
+                )
+            except ProviderNonJsonContentError as exc:
+                if repair_attempt >= contract_retries:
+                    raise
+                calls.append(
+                    ProviderCallResult(
+                        content={},
+                        usage=dict(exc.usage),
+                        attempts=exc.attempts,
+                        elapsed_ms=exc.elapsed_ms,
+                    )
+                )
+                repair_feedback = "provider output was not a valid JSON object"
+                previous_output = exc.content
+                progress(
+                    "provider_contract_repair",
+                    chunkIndex=chunk_index,
+                    chunkCount=chunk_count,
+                    repairAttempt=repair_attempt + 1,
+                    repairLimit=contract_retries,
+                )
+                continue
             calls.append(call)
             try:
                 validate_instance(call.content, task.output_schema, label="output")
@@ -782,7 +805,7 @@ class ModelProcessingEngine:
         temperature: float,
         max_tokens: int | None,
         repair_feedback: str | None,
-        previous_output: dict[str, Any] | None,
+        previous_output: dict[str, Any] | str | None,
     ) -> ProviderCallResult:
         model_payload = {
             "outputSchema": task.output_schema,

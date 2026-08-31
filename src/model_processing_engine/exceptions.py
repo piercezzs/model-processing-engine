@@ -34,6 +34,14 @@ class ProviderEmptyContentError(ProviderError):
     """A provider completed a request but returned no assistant content."""
 
 
+class ProviderNonJsonContentError(ProviderError):
+    """A structured-output request returned bounded, non-JSON assistant content."""
+
+    def __init__(self, message: str, *, content: str, **kwargs: object) -> None:
+        super().__init__(message, **kwargs)
+        self.content = str(content)[:50_000]
+
+
 class ConfigurationError(ModelProcessingError):
     """Local runtime configuration is invalid or incomplete."""
 

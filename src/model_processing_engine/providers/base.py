@@ -83,7 +83,7 @@ class ModelProvider(Protocol):
         temperature: float,
         max_tokens: int | None,
         repair_feedback: str | None = None,
-        previous_output: dict[str, Any] | None = None,
+        previous_output: dict[str, Any] | str | None = None,
     ) -> ProviderCallResult: ...
 
     def stream_text(

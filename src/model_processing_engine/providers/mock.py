@@ -47,7 +47,7 @@ class MockProvider:
         temperature: float,
         max_tokens: int | None,
         repair_feedback: str | None = None,
-        previous_output: dict[str, Any] | None = None,
+        previous_output: dict[str, Any] | str | None = None,
     ) -> ProviderCallResult:
         del model, system_prompt, temperature, max_tokens, repair_feedback, previous_output
         started = time.perf_counter()

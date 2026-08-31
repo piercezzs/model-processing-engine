@@ -13,6 +13,7 @@ from model_processing_engine.exceptions import (
     ConfigurationError,
     ProviderEmptyContentError,
     ProviderError,
+    ProviderNonJsonContentError,
 )
 
 from .base import (
@@ -49,7 +50,7 @@ class OpenAICompatibleProvider:
         temperature: float,
         max_tokens: int | None,
         repair_feedback: str | None = None,
-        previous_output: dict[str, Any] | None = None,
+        previous_output: dict[str, Any] | str | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> ProviderCallResult:
         api_key = self._credential_resolver(self.config.api_key_env).strip()
@@ -66,17 +67,22 @@ class OpenAICompatibleProvider:
         ]
         if repair_feedback:
             if previous_output is not None:
+                previous_content = (
+                    _bounded_text(previous_output, maximum=50_000)
+                    if isinstance(previous_output, str)
+                    else _bounded_json(previous_output, maximum=50_000)
+                )
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": _bounded_json(previous_output, maximum=50_000),
+                        "content": previous_content,
                     }
                 )
             messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "The previous JSON object failed the declared output contract. "
+                        "The previous output failed the declared JSON contract. "
                         f"Validation error: {_preview(repair_feedback)}. "
                         "Return one corrected JSON object only. Preserve the task meaning "
                         "and do not add fields outside the declared schema."
@@ -548,8 +554,9 @@ def _parse_json_content(content: str) -> dict[str, Any]:
             continue
         if isinstance(parsed, dict):
             return parsed
-    raise ProviderError(
+    raise ProviderNonJsonContentError(
         f"Provider returned non-JSON content: {_preview(content)}",
+        content=content,
         audit_message="Provider returned non-JSON content",
     )
 
@@ -631,6 +638,16 @@ def _provider_call_error(
     attempts: int,
     elapsed_ms: int,
 ) -> ProviderError:
+    if isinstance(error, ProviderNonJsonContentError):
+        return ProviderNonJsonContentError(
+            str(error),
+            content=error.content,
+            usage=usage,
+            attempts=attempts,
+            elapsed_ms=elapsed_ms,
+            audit_message=error.audit_message,
+            audit_calls=error.audit_calls,
+        )
     error_type = ProviderEmptyContentError if isinstance(error, ProviderEmptyContentError) else ProviderError
     return error_type(
         str(error),

@@ -11,6 +11,7 @@ from unittest.mock import PropertyMock, patch
 from model_processing_engine.cache import SQLiteRuntimeStore
 from model_processing_engine.contracts import TaskDefinition
 from model_processing_engine.engine import ENGINE_CACHE_SCHEMA, MAX_BATCH_CHUNKS
+from model_processing_engine.exceptions import ProviderNonJsonContentError
 from model_processing_engine.providers.base import ProviderCallResult
 
 from tests.helpers import engine_with_mock, execution_request, task_definition
@@ -376,6 +377,83 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(result.timing["contractRepairs"], 1)
             self.assertEqual(provider.call_count, 2)
             self.assertEqual(history["summary"]["contractRepairs"], 1)
+
+    def test_non_json_output_is_repaired_once_with_bounded_previous_content(self) -> None:
+        attempts = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir))
+
+            def call_json(**kwargs):
+                attempts.append(kwargs)
+                if len(attempts) == 1:
+                    raise ProviderNonJsonContentError(
+                        "Provider returned non-JSON content",
+                        content="plain provider response",
+                        usage={
+                            "available": True,
+                            "inputTokens": 7,
+                            "outputTokens": 3,
+                            "totalTokens": 10,
+                        },
+                        attempts=1,
+                        elapsed_ms=4,
+                        audit_message="Provider returned non-JSON content",
+                    )
+                return ProviderCallResult(
+                    content={"summary": "repaired"},
+                    usage={
+                        "available": True,
+                        "inputTokens": 9,
+                        "outputTokens": 4,
+                        "totalTokens": 13,
+                    },
+                    attempts=1,
+                    elapsed_ms=5,
+                )
+
+            provider.call_json = call_json
+            result = engine.execute(execution_request(task_definition()))
+            history = engine.store.execution_history()
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.result, {"summary": "repaired"})
+        self.assertEqual(result.timing["providerCallCount"], 2)
+        self.assertEqual(result.timing["contractRepairs"], 1)
+        self.assertEqual(result.usage["totalTokens"], 23)
+        self.assertEqual(attempts[1]["previous_output"], "plain provider response")
+        self.assertIn("not a valid JSON object", attempts[1]["repair_feedback"])
+        self.assertEqual(history["summary"]["providerCallCount"], 2)
+        self.assertEqual(history["summary"]["contractRepairs"], 1)
+
+    def test_runtime_can_disable_non_json_contract_repair(self) -> None:
+        attempts = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(Path(temp_dir))
+
+            def call_json(**kwargs):
+                attempts.append(kwargs)
+                raise ProviderNonJsonContentError(
+                    "Provider returned non-JSON content",
+                    content="plain provider response",
+                    attempts=1,
+                    audit_message="Provider returned non-JSON content",
+                )
+
+            provider.call_json = call_json
+            result = engine.execute(
+                execution_request(
+                    task_definition(),
+                    runtime={"contractRetries": 0},
+                )
+            )
+            history = engine.store.execution_history()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(history["summary"]["providerCallCount"], 1)
+        self.assertEqual(history["summary"]["contractRepairs"], 0)
 
     def test_runtime_can_disable_contract_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

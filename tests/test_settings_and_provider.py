@@ -13,6 +13,7 @@ from model_processing_engine.exceptions import (
     ConfigurationError,
     ProviderEmptyContentError,
     ProviderError,
+    ProviderNonJsonContentError,
 )
 from model_processing_engine.providers.base import (
     ProviderConfig,
@@ -463,6 +464,75 @@ class SettingsAndProviderTests(unittest.TestCase):
             "user",
         ])
         self.assertIn("missing required property", payload["messages"][-1]["content"])
+
+    def test_non_json_content_error_preserves_output_and_usage_for_repair(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response({
+            "choices": [{"message": {"content": "plain provider response"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 5, "total_tokens": 13},
+        })
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ):
+                with self.assertRaises(ProviderNonJsonContentError) as raised:
+                    provider.call_json(
+                        model="",
+                        system_prompt="Return JSON",
+                        input_payload={"input": {"text": "hello"}},
+                        output_schema={"type": "object"},
+                        temperature=0,
+                        max_tokens=None,
+                    )
+
+        self.assertEqual(raised.exception.content, "plain provider response")
+        self.assertEqual(raised.exception.usage["totalTokens"], 13)
+        self.assertEqual(
+            raised.exception.audit_message,
+            "Provider returned non-JSON content",
+        )
+
+    def test_contract_repair_appends_non_json_previous_output_verbatim(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="test-model",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {"choices": [{"message": {"content": '{"summary":"fixed"}'}}]}
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                provider.call_json(
+                    model="",
+                    system_prompt="Return JSON",
+                    input_payload={"input": {"text": "hello"}},
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=None,
+                    repair_feedback="provider output was not a valid JSON object",
+                    previous_output="plain provider response",
+                )
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["messages"][2]["role"], "assistant")
+        self.assertEqual(payload["messages"][2]["content"], "plain provider response")
 
     def test_empty_provider_content_preserves_usage_for_audit(self) -> None:
         provider = OpenAICompatibleProvider(
