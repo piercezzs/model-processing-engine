@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
@@ -265,6 +266,69 @@ class EngineTests(unittest.TestCase):
                 )
             )
             self.assertEqual(provider.call_count, 3)
+
+    def test_reasoning_effort_is_cache_identity_and_execution_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            engine, provider = engine_with_mock(
+                root,
+                responder=summary_responder,
+                provider_type="openai_compatible",
+                default_model="gpt-5.6-sol",
+            )
+            task = task_definition()
+            low = execution_request(
+                task,
+                runtime={"model": "gpt-5.6-sol", "reasoningEffort": "low"},
+            )
+            high = execution_request(
+                task,
+                runtime={"model": "gpt-5.6-sol", "reasoningEffort": "high"},
+            )
+
+            first = engine.execute(low)
+            second = engine.execute(high)
+            cached = engine.execute(low)
+
+            self.assertEqual(provider.call_count, 2)
+            self.assertFalse(first.cache["hit"])
+            self.assertFalse(second.cache["hit"])
+            self.assertTrue(cached.cache["hit"])
+            self.assertEqual(first.provider["reasoning"]["effective"], "low")
+            self.assertEqual(first.provider["reasoning"]["source"], "runtime")
+            history = engine.store.execution_history()
+            low_history = next(
+                item
+                for item in history["items"]
+                if item["executionId"] == first.execution_id
+            )
+            self.assertEqual(low_history["provider"]["reasoning"]["effective"], "low")
+            with sqlite3.connect(root / "runtime.sqlite") as connection:
+                efforts = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT reasoning_effort FROM provider_call_records ORDER BY created_at"
+                    )
+                ]
+            self.assertEqual(efforts, ["low", "high"])
+
+    def test_unsupported_reasoning_effort_fails_before_provider_io(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine, provider = engine_with_mock(
+                Path(temp_dir),
+                provider_type="openai_compatible",
+                default_model="gpt-5.5",
+            )
+            result = engine.execute(
+                execution_request(
+                    task_definition(),
+                    runtime={"model": "gpt-5.5", "reasoningEffort": "max"},
+                )
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("does not support reasoning effort", result.error)
+            self.assertEqual(provider.call_count, 0)
 
     def test_namespace_is_mandatory_cache_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

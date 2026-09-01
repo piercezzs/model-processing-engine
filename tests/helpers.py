@@ -80,13 +80,17 @@ def engine_with_mock(
     delay_seconds: float = 0,
     provider_max_concurrency: int = 8,
     service_max_concurrency: int = 64,
+    provider_type: str = "mock",
+    default_model: str = "mock-v1",
+    default_reasoning_effort: str = "auto",
 ) -> tuple[ModelProcessingEngine, MockProvider]:
     config = ProviderConfig(
         id="mock",
-        type="mock",
-        default_model="mock-v1",
+        type=provider_type,
+        default_model=default_model,
         max_concurrency=provider_max_concurrency,
         capabilities=("structured_json", "text_stream"),
+        default_reasoning_effort=default_reasoning_effort,
     )
     provider = MockProvider(
         config,

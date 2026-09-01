@@ -95,6 +95,8 @@ class VerificationScriptContractTests(unittest.TestCase):
         self.assertIn("historyProviderCacheTokens", module.ADMIN_SCRIPT_MARKERS)
         self.assertIn("historyTransportRetries", module.ADMIN_SCRIPT_MARKERS)
         self.assertIn("nativeJsonSchema", module.ADMIN_SCRIPT_MARKERS)
+        self.assertIn("modelReasoningCapabilities", module.ADMIN_SCRIPT_MARKERS)
+        self.assertIn("defaultReasoningEffort", module.ADMIN_SCRIPT_MARKERS)
 
 
 if __name__ == "__main__":

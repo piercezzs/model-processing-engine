@@ -36,6 +36,13 @@ Every final cache key includes the caller namespace, task digest, provider
 identity, model, inference parameters, semantic cache version, and normalized
 input identity. Namespaces never share entries.
 
+Reasoning effort is one of those inference parameters. Resolution is explicit:
+request runtime overrides Task defaults, which override the Provider default;
+`auto` omits a wire parameter. Known unsupported model/value combinations fail
+before Provider I/O, and unknown models are auto-only. This prevents both cache
+reuse across materially different reasoning settings and silent cross-model
+parameter downgrades.
+
 Cached model output is disposable computation reuse. Durable business results
 remain owned and stored by the caller.
 
@@ -108,7 +115,9 @@ IDs and batch-level aggregates, but do not own a competing complete ledger.
 `provider_call_records` stores one redacted row per real upstream request. The
 second layer preserves usage for batch chunks, probe retries, transport errors,
 contract-repair calls, and calls whose returned content later fails output-schema
-validation. Neither layer stores prompts, caller input, Provider response bodies,
+validation. It also retains the reasoning effort sent for each call, while the
+execution envelope records the requested, resolved, and source setting. Neither
+layer stores prompts, caller input, Provider response bodies,
 or credentials in the history query surface. The queue table temporarily stores
 the complete validated asynchronous request for recovery, is not exposed by the
 history API, rejects sensitive tasks through the request contract, and deletes
@@ -207,7 +216,7 @@ enabled.
 
 Provider tests use submitted credentials only in memory. A successful test
 issues a short-lived token bound to the exact Provider/model-list/default-model/
-key/concurrency payload. Only a matching token can activate that payload.
+key/concurrency/reasoning payload. Only a matching token can activate that payload.
 Every test attempt is written to the redacted execution ledger; successful
 tests retain Provider-reported usage when available, while failed tests retain
 status and a bounded diagnostic without credentials or request content.
@@ -218,6 +227,13 @@ entry as the compatibility fallback. Activation atomically writes the project
 `.env` and ignored `config/providers.local.json`, then starts a detached control
 helper that uses the existing verified process manager to restart the service.
 The UI polls health and obtains a new CSRF token after recovery.
+
+Model discovery also returns model-reasoning capability descriptors from MPE's
+local registry. Selecting a model only recomputes form options; it does not call
+the model. The existing OpenAI-compatible Provider maps supported explicit values
+to Chat Completions `reasoning_effort`. Native Anthropic `output_config.effort`
+and legacy thinking-budget controls are outside this adapter's protocol boundary
+and require a dedicated Provider implementation rather than guessed passthrough.
 
 The admin surface keeps Provider configuration and execution observability as
 separate top-level views. Its history view defaults to formal tasks so Provider

@@ -118,12 +118,60 @@ class AdminConfigManagerTests(unittest.TestCase):
             self.assertEqual(selected["modelsPath"], "/models")
             self.assertEqual(selected["maxConcurrency"], 8)
             self.assertTrue(selected["nativeJsonSchema"])
+            self.assertEqual(
+                selected["modelReasoningCapabilities"]["model-one"]["options"],
+                ["auto"],
+            )
             local = json.loads(
                 (project / "config" / "providers.local.json").read_text(encoding="utf-8")
             )
             self.assertIn(
                 "native_json_schema",
                 local["providers"]["private-model"]["capabilities"],
+            )
+
+    def test_reasoning_effort_is_tested_and_persisted_for_supported_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            project = self._project(Path(temp_dir))
+            manager = AdminConfigManager(project)
+            draft = ProviderDraft.model_validate(
+                {
+                    "providerId": "sub2api",
+                    "type": "openai_compatible",
+                    "baseUrl": "http://127.0.0.1:8080/v1",
+                    "model": "gpt-5.6-sol",
+                    "availableModels": ["gpt-5.6-sol"],
+                    "defaultReasoningEffort": "xhigh",
+                    "apiKey": "local-secret",
+                }
+            )
+            with patch.object(
+                manager,
+                "_call_provider",
+                return_value={"elapsedMs": 12},
+            ):
+                tested = manager.test_provider(draft)
+            request = ApplyProviderRequest.model_validate(
+                {
+                    **draft.model_dump(by_alias=True),
+                    "verificationToken": tested["verificationToken"],
+                }
+            )
+            manager.apply_provider(request)
+
+            local = json.loads(
+                (project / "config" / "providers.local.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(tested["reasoningEffort"], "xhigh")
+            self.assertEqual(
+                local["providers"]["sub2api"]["defaultReasoningEffort"],
+                "xhigh",
+            )
+            snapshot = manager.snapshot()["providers"]
+            selected = next(item for item in snapshot if item["id"] == "sub2api")
+            self.assertIn(
+                "max",
+                selected["modelReasoningCapabilities"]["gpt-5.6-sol"]["options"],
             )
 
     def test_model_discovery_uses_key_without_persisting_it(self) -> None:

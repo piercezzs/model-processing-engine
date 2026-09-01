@@ -8,6 +8,8 @@ const state = {
   config: null,
   selectedProviderId: "",
   availableModels: [],
+  modelReasoningCapabilities: {},
+  modelDiscoveryRequestId: 0,
   verificationToken: "",
   historyPeriod: "day",
   historyOffset: 0,
@@ -41,6 +43,8 @@ const elements = {
   modelManual: document.querySelector("#model-manual"),
   modelState: document.querySelector("#model-state"),
   discoverModels: document.querySelector("#discover-models"),
+  reasoningEffort: document.querySelector("#reasoning-effort"),
+  reasoningState: document.querySelector("#reasoning-state"),
   timeoutSeconds: document.querySelector("#timeout-seconds"),
   maxConcurrency: document.querySelector("#max-concurrency"),
   transportRetries: document.querySelector("#transport-retries"),
@@ -85,6 +89,16 @@ const compactNumberFormatter = new Intl.NumberFormat("zh-CN", {
   notation: "compact",
   maximumFractionDigits: 1,
 });
+
+const REASONING_LABELS = {
+  auto: "自动（模型默认）",
+  none: "None（不启用推理）",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Maximum",
+};
 
 function setServiceState(online, label) {
   elements.serviceDot.classList.toggle("online", online);
@@ -684,6 +698,43 @@ function selectedModel() {
     : elements.modelSelect.value.trim();
 }
 
+function renderReasoningOptions(preferred = "auto", {announceChange = false} = {}) {
+  const model = selectedModel();
+  const capability = state.modelReasoningCapabilities[model] || {
+    configurable: false,
+    options: ["auto"],
+    modelDefault: null,
+    wireParameter: null,
+  };
+  const options = Array.isArray(capability.options) && capability.options.length
+    ? capability.options
+    : ["auto"];
+  const selected = options.includes(preferred) ? preferred : "auto";
+  elements.reasoningEffort.replaceChildren();
+  for (const value of options) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = REASONING_LABELS[value] || value;
+    elements.reasoningEffort.append(option);
+  }
+  elements.reasoningEffort.value = selected;
+  elements.reasoningEffort.disabled = options.length === 1;
+  if (announceChange && selected !== preferred) {
+    elements.reasoningState.textContent = "所选模型不支持原推理强度，已恢复为自动。";
+    return;
+  }
+  if (!capability.configurable) {
+    elements.reasoningState.textContent = model
+      ? "该模型在当前协议下没有已确认的推理强度参数，将使用模型默认行为。"
+      : "选择模型后，将显示该模型支持的推理强度。";
+    return;
+  }
+  const defaultLabel = capability.modelDefault
+    ? (REASONING_LABELS[capability.modelDefault] || capability.modelDefault)
+    : "由模型决定";
+  elements.reasoningState.textContent = `自动不会发送强度参数；该模型的已知默认值为 ${defaultLabel}。`;
+}
+
 function selectProvider(providerId) {
   const provider = state.config.providers.find((item) => item.id === providerId);
   if (!provider) {
@@ -702,6 +753,7 @@ function selectProvider(providerId) {
   elements.maxConcurrency.value = String(provider.maxConcurrency);
   elements.transportRetries.value = String(provider.transportRetries);
   elements.nativeJsonSchema.checked = Boolean(provider.nativeJsonSchema);
+  state.modelReasoningCapabilities = provider.modelReasoningCapabilities || {};
   elements.credentialState.textContent = provider.credentialConfigured
     ? "Key 已配置；留空将使用现有值"
     : "尚未配置 Key";
@@ -709,6 +761,7 @@ function selectProvider(providerId) {
   elements.editorTitle.textContent = `配置 ${provider.id}`;
   elements.applyProvider.disabled = true;
   renderModelOptions(provider.availableModels, provider.defaultModel);
+  renderReasoningOptions(provider.defaultReasoningEffort || "auto");
   updateProviderType();
   setResult("修改配置后，请先测试连接。", "neutral");
   renderProviderList();
@@ -728,6 +781,8 @@ function applyPreset(presetId, {updateProviderId = false} = {}) {
     elements.providerId.value = preset.providerId;
   }
   renderModelOptions(preset.type === "mock" ? ["schema-sample-v1"] : [], preset.type === "mock" ? "schema-sample-v1" : "");
+  state.modelReasoningCapabilities = {};
+  renderReasoningOptions("auto");
   updateProviderType();
 }
 
@@ -786,6 +841,7 @@ function collectDraft() {
     ...collectConnectionDraft(),
     model,
     availableModels,
+    defaultReasoningEffort: elements.reasoningEffort.value || "auto",
   };
 }
 
@@ -799,6 +855,7 @@ function reportConnectionValidity() {
     elements.timeoutSeconds,
     elements.maxConcurrency,
     elements.transportRetries,
+    elements.reasoningEffort,
   ];
   for (const control of controls) {
     if (!control.checkValidity()) {
@@ -813,6 +870,7 @@ async function discoverModels() {
   if (!reportConnectionValidity()) {
     return;
   }
+  const requestId = ++state.modelDiscoveryRequestId;
   setButtonLoading(elements.discoverModels, true, "正在获取…");
   elements.modelState.textContent = "正在读取当前账号可用的模型列表…";
   try {
@@ -820,17 +878,28 @@ async function discoverModels() {
       method: "POST",
       body: JSON.stringify(collectConnectionDraft()),
     });
+    if (requestId !== state.modelDiscoveryRequestId) {
+      return;
+    }
     const current = selectedModel();
     const nextModel = payload.models.includes(current) ? current : payload.models[0];
+    const previousEffort = elements.reasoningEffort.value || "auto";
+    state.modelReasoningCapabilities = payload.modelReasoningCapabilities || {};
     renderModelOptions(payload.models, nextModel);
+    renderReasoningOptions(previousEffort, {announceChange: true});
     invalidateVerification();
     setResult(`已获取 ${payload.models.length} 个模型，请确认默认执行模型。`, "success");
   } catch (error) {
+    if (requestId !== state.modelDiscoveryRequestId) {
+      return;
+    }
     elements.modelState.textContent = "自动获取失败，仍可手动填写模型 ID。";
     setResult(`${error.message}；你仍可以手动填写模型 ID。`, "error");
   } finally {
-    setButtonLoading(elements.discoverModels, false, "");
-    updateProviderType();
+    if (requestId === state.modelDiscoveryRequestId) {
+      setButtonLoading(elements.discoverModels, false, "");
+      updateProviderType();
+    }
   }
 }
 
@@ -951,8 +1020,14 @@ elements.providerType.addEventListener("change", () => {
   invalidateVerification();
 });
 elements.modelSelect.addEventListener("change", () => {
+  const previousEffort = elements.reasoningEffort.value || "auto";
   updateManualModelVisibility();
+  renderReasoningOptions(previousEffort, {announceChange: true});
   invalidateVerification();
+});
+elements.modelManual.addEventListener("input", () => {
+  const previousEffort = elements.reasoningEffort.value || "auto";
+  renderReasoningOptions(previousEffort, {announceChange: true});
 });
 elements.form.addEventListener("input", invalidateVerification);
 elements.discoverModels.addEventListener("click", discoverModels);

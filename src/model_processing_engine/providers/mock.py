@@ -5,6 +5,8 @@ import threading
 import time
 from typing import Any, Callable, Iterator
 
+from model_processing_engine.reasoning import ReasoningEffort
+
 from .base import (
     ProviderCallResult,
     ProviderConfig,
@@ -46,10 +48,12 @@ class MockProvider:
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None = None,
         repair_feedback: str | None = None,
         previous_output: dict[str, Any] | str | None = None,
     ) -> ProviderCallResult:
-        del model, system_prompt, temperature, max_tokens, repair_feedback, previous_output
+        del model, system_prompt, temperature, max_tokens, reasoning_effort
+        del repair_feedback, previous_output
         started = time.perf_counter()
         with self._lock:
             self.call_count += 1
@@ -80,10 +84,11 @@ class MockProvider:
         input_payload: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None = None,
         repair_feedback: str | None = None,
         previous_output: str | None = None,
     ) -> Iterator[ProviderTextEvent]:
-        del model, system_prompt, temperature, max_tokens
+        del model, system_prompt, temperature, max_tokens, reasoning_effort
         started = time.perf_counter()
         with self._lock:
             self.call_count += 1

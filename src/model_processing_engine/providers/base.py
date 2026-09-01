@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol, cast
 from urllib.parse import urlparse
 
 from model_processing_engine.canonical import digest_json
 from model_processing_engine.exceptions import ConfigurationError
+from model_processing_engine.reasoning import (
+    ReasoningEffort,
+    ReasoningEffortSetting,
+    reasoning_capabilities,
+    resolve_reasoning_effort,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,7 @@ class ProviderConfig:
     cache_identity: str = "1"
     available_models: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ("structured_json",)
+    default_reasoning_effort: ReasoningEffortSetting = "auto"
 
     @property
     def identity(self) -> dict[str, Any]:
@@ -34,6 +41,7 @@ class ProviderConfig:
             "chatCompletionsPath": self.chat_completions_path,
             "cacheIdentity": self.cache_identity,
             "capabilities": list(self.capabilities),
+            "defaultReasoningEffort": self.default_reasoning_effort,
         }
 
     @property
@@ -82,6 +90,7 @@ class ModelProvider(Protocol):
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None = None,
         repair_feedback: str | None = None,
         previous_output: dict[str, Any] | str | None = None,
     ) -> ProviderCallResult: ...
@@ -94,6 +103,7 @@ class ModelProvider(Protocol):
         input_payload: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None = None,
         repair_feedback: str | None = None,
         previous_output: str | None = None,
     ) -> Iterator[ProviderTextEvent]: ...
@@ -130,6 +140,11 @@ class ProviderRegistry:
                 "availableModels": list(provider.config.available_models),
                 "capabilities": list(provider.config.capabilities),
                 "maxConcurrency": provider.config.max_concurrency,
+                "defaultReasoningEffort": provider.config.default_reasoning_effort,
+                "modelReasoningCapabilities": reasoning_capabilities(
+                    provider.config.type,
+                    provider.config.available_models,
+                ),
             }
             for provider in (self._providers[provider_id] for provider_id in self.ids())
         ]
@@ -199,6 +214,17 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         raise ConfigurationError(
             f"Provider {provider_id} defaultModel must appear in availableModels"
         )
+    default_reasoning_effort = _reasoning_effort_setting(
+        value.get("defaultReasoningEffort", "auto"),
+        provider_id=provider_id,
+    )
+    resolve_reasoning_effort(
+        provider_type=provider_type,
+        model=default_model,
+        runtime_setting=None,
+        task_setting=None,
+        provider_setting=default_reasoning_effort,
+    )
     return ProviderConfig(
         id=provider_id,
         type=provider_type,
@@ -212,6 +238,7 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         cache_identity=str(value.get("cacheIdentity") or "1").strip(),
         available_models=available_models,
         capabilities=capabilities,
+        default_reasoning_effort=default_reasoning_effort,
     )
 
 
@@ -224,3 +251,13 @@ def _string_tuple(value: Any, *, label: str) -> tuple[str, ...]:
     if len(set(normalized)) != len(normalized):
         raise ConfigurationError(f"Provider {label} must not contain duplicates")
     return normalized
+
+
+def _reasoning_effort_setting(value: Any, *, provider_id: str) -> ReasoningEffortSetting:
+    normalized = str(value or "auto").strip().casefold()
+    allowed = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+    if normalized not in allowed:
+        raise ConfigurationError(
+            f"Provider {provider_id} defaultReasoningEffort is not supported"
+        )
+    return cast(ReasoningEffortSetting, normalized)

@@ -101,6 +101,14 @@
             <small id="model-state">尚未获取模型；也可以手动填写模型 ID。</small>
           </div>
 
+          <label class="field">
+            <span>默认推理强度</span>
+            <select id="reasoning-effort" name="reasoningEffort" aria-describedby="reasoning-state">
+              <option value="auto">自动（模型默认）</option>
+            </select>
+            <small id="reasoning-state">选择模型后，将显示该模型支持的推理强度。</small>
+          </label>
+
           <details class="advanced-settings">
             <summary>高级连接设置</summary>
             <div class="field-grid two-columns advanced-grid">

@@ -137,6 +137,18 @@ also sets the Provider's maximum concurrent in-flight requests. Actual
 concurrency is demand-driven: one pending execution uses one slot, while larger
 workloads queue after the configured Provider limit.
 
+The default reasoning-effort picker is model-aware. Model discovery returns a
+local capability descriptor for every discovered model, so changing the picker
+does not make a model call. `auto` is the safe default and omits the wire
+parameter, leaving the upstream model or gateway default unchanged. A supported
+explicit value is sent as Chat Completions `reasoning_effort`. If a model change
+makes the selected value invalid, the page visibly resets it to `auto`; the
+server also rejects unsupported combinations instead of silently downgrading.
+The built-in registry currently covers the verified GPT-5.6 Sol/Terra/Luna and
+GPT-5.5 families. Unknown models, including Claude models routed through the
+generic OpenAI-compatible transport, remain auto-only until MPE has an explicit
+compatible mapping or a native Provider adapter.
+
 The advanced **Provider native JSON Schema** switch is an explicit capability
 declaration, not automatic detection. Enable it only when the selected platform
 and model support Chat Completions `response_format.type=json_schema`. MPE still
@@ -208,6 +220,7 @@ tasks/example/
     "providerId": "openai-compatible",
     "model": "your-model-id",
     "temperature": 0.1,
+    "reasoningEffort": "auto",
     "contractRetries": 1
   }
 }
@@ -223,6 +236,14 @@ Supported cache modes are:
 All modes also include namespace, complete Task Pack digest, provider identity,
 model, inference parameters, and semantic version. Cached output is disposable;
 the caller remains responsible for authoritative business data.
+
+Reasoning effort follows this precedence: execution
+`runtime.reasoningEffort`, Task `runtimeDefaults.reasoningEffort`, Provider
+`defaultReasoningEffort`, then `auto`. Allowed API-native values are `auto`,
+`none`, `low`, `medium`, `high`, `xhigh`, and `max`, but every explicit value is
+validated against the selected model's capability profile. `auto` is represented
+as an omitted Provider parameter. The resolved value participates in result-cache
+identity and is retained in the execution envelope and Provider-call audit.
 
 `runtime.forceRefresh` bypasses cache reads. After a successful provider call and
 output validation, the engine replaces the matching reusable cache entry. A
@@ -432,7 +453,7 @@ decoding, preventing a misconfigured or hostile endpoint from exhausting memory
 with an unbounded response.
 
 Provider configuration may declare `availableModels`, `capabilities`, and
-`maxConcurrency`. The `/v1/providers` response exposes those non-secret
+`maxConcurrency`, plus `defaultReasoningEffort`. The `/v1/providers` response exposes those non-secret
 declarations while preserving the original provider-ID list for compatibility.
 `structured_json` uses JSON-object mode. `native_json_schema` sends the task
 output schema through the Provider's strict JSON Schema request field and must

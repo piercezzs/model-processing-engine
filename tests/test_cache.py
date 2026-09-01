@@ -53,6 +53,56 @@ class CacheStoreTests(unittest.TestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record.result, {"summary": "saved"})
 
+    def test_provider_call_schema_adds_reasoning_effort_to_existing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runtime.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE provider_call_records (
+                        call_id TEXT PRIMARY KEY,
+                        execution_id TEXT NOT NULL,
+                        purpose TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        usage_json TEXT NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        elapsed_ms INTEGER NOT NULL,
+                        error TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+
+            store = SQLiteRuntimeStore(path)
+            with store._connect() as connection:
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(provider_call_records)"
+                    ).fetchall()
+                }
+            self.assertIn("reasoning_effort", columns)
+
+            store.save_provider_call(
+                {
+                    "callId": "call-one",
+                    "executionId": "execution-one",
+                    "providerId": "openai-compatible",
+                    "model": "gpt-5.6-sol",
+                    "reasoningEffort": "xhigh",
+                    "status": "succeeded",
+                }
+            )
+            with store._connect() as connection:
+                effort = connection.execute(
+                    "SELECT reasoning_effort FROM provider_call_records WHERE call_id = ?",
+                    ("call-one",),
+                ).fetchone()[0]
+            self.assertEqual(effort, "xhigh")
+
     def test_cache_hit_and_terminal_execution_commit_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteRuntimeStore(Path(temp_dir) / "runtime.sqlite")

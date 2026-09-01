@@ -522,6 +522,15 @@ def _record_provider_test(
             "provider": {
                 "id": draft.provider_id,
                 "model": draft.model or "schema-sample-v1",
+                "reasoning": {
+                    "requested": draft.default_reasoning_effort,
+                    "effective": (
+                        None
+                        if draft.default_reasoning_effort == "auto"
+                        else draft.default_reasoning_effort
+                    ),
+                    "source": "provider_test",
+                },
             },
             "cache": {"mode": "disabled", "hit": False},
             "usage": usage,
@@ -548,6 +557,7 @@ def _record_provider_test(
                 "sequence": index,
                 "providerId": draft.provider_id,
                 "model": draft.model or "schema-sample-v1",
+                "reasoningEffort": draft.default_reasoning_effort,
                 "status": str(call.get("status") or "failed"),
                 "usage": dict(call.get("usage") or {}),
                 "attempts": int(call.get("attempts") or 0),

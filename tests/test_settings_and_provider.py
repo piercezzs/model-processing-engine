@@ -628,6 +628,37 @@ class SettingsAndProviderTests(unittest.TestCase):
                     max_tokens=None,
                 )
 
+    def test_openai_compatible_provider_sends_reasoning_effort_when_explicit(self) -> None:
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(
+                id="test",
+                type="openai_compatible",
+                default_model="gpt-5.6-sol",
+                base_url="https://example.invalid/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            )
+        )
+        response = _Response(
+            {"choices": [{"message": {"content": '{"status":"ok"}'}}]}
+        )
+        with patch.dict(os.environ, {"TEST_PROVIDER_KEY": "secret"}, clear=True):
+            with patch(
+                "model_processing_engine.providers.openai_compatible._open_without_redirects",
+                return_value=response,
+            ) as urlopen:
+                provider.call_json(
+                    model="gpt-5.6-sol",
+                    system_prompt="Return JSON",
+                    input_payload={},
+                    output_schema={"type": "object"},
+                    temperature=0,
+                    max_tokens=None,
+                    reasoning_effort="xhigh",
+                )
+
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["reasoning_effort"], "xhigh")
+
     def test_openai_compatible_provider_lists_unique_models(self) -> None:
         provider = OpenAICompatibleProvider(
             ProviderConfig(

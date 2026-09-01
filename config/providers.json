@@ -5,6 +5,7 @@
     "mock": {
       "type": "mock",
       "defaultModel": "schema-sample-v1",
+      "defaultReasoningEffort": "auto",
       "cacheIdentity": "mock-v1",
       "maxConcurrency": 8,
       "availableModels": ["schema-sample-v1"],
@@ -16,6 +17,7 @@
       "chatCompletionsPath": "/chat/completions",
       "apiKeyEnv": "MPE_AI_API_KEY",
       "defaultModel": "",
+      "defaultReasoningEffort": "auto",
       "timeoutSeconds": 60,
       "transportRetries": 2,
       "maxConcurrency": 8,

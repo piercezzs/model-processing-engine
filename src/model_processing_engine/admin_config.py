@@ -20,6 +20,12 @@ from .project_environment import read_env_file, update_project_environment
 from .providers.base import ProviderCallResult, ProviderConfig, load_provider_registry_data
 from .providers.mock import MockProvider
 from .providers.openai_compatible import OpenAICompatibleProvider
+from .reasoning import (
+    ReasoningEffortSetting,
+    reasoning_capabilities,
+    reasoning_capability,
+    resolve_reasoning_effort,
+)
 
 
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -132,6 +138,10 @@ class ProviderDraft(ProviderConnectionDraft):
         alias="availableModels",
         max_length=512,
     )
+    default_reasoning_effort: ReasoningEffortSetting = Field(
+        default="auto",
+        alias="defaultReasoningEffort",
+    )
 
     @field_validator("model")
     @classmethod
@@ -152,6 +162,16 @@ class ProviderDraft(ProviderConnectionDraft):
     def validate_model(self) -> "ProviderDraft":
         if self.type == "openai_compatible" and not self.model:
             raise ValueError("model is required for an OpenAI-compatible provider")
+        capability = reasoning_capability(self.type, self.model or "schema-sample-v1")
+        if (
+            self.default_reasoning_effort != "auto"
+            and self.default_reasoning_effort not in capability.supported_efforts
+        ):
+            supported = ", ".join(("auto", *capability.supported_efforts))
+            raise ValueError(
+                f"defaultReasoningEffort is not supported by {self.model!r}; "
+                f"supported values: {supported}"
+            )
         return self
 
 
@@ -199,6 +219,17 @@ class AdminConfigManager:
                         "availableModels": [
                             str(item) for item in value.get("availableModels", [])
                         ],
+                        "defaultReasoningEffort": str(
+                            value.get("defaultReasoningEffort") or "auto"
+                        ),
+                        "modelReasoningCapabilities": reasoning_capabilities(
+                            str(value.get("type") or ""),
+                            [
+                                str(item) for item in value.get("availableModels", [])
+                                if str(item).strip()
+                            ]
+                            + [str(value.get("defaultModel") or "")],
+                        ),
                         "timeoutSeconds": int(value.get("timeoutSeconds") or 60),
                         "transportRetries": int(
                             value.get("transportRetries")
@@ -232,10 +263,15 @@ class AdminConfigManager:
     def discover_models(self, draft: ModelDiscoveryRequest) -> dict[str, Any]:
         with self._lock:
             if draft.type == "mock":
+                models = ["schema-sample-v1"]
                 return {
                     "status": "ok",
                     "providerId": draft.provider_id,
-                    "models": ["schema-sample-v1"],
+                    "models": models,
+                    "modelReasoningCapabilities": reasoning_capabilities(
+                        draft.type,
+                        models,
+                    ),
                     "elapsedMs": 0,
                     "attempts": 1,
                 }
@@ -257,10 +293,15 @@ class AdminConfigManager:
                 credential_resolver=lambda _name: api_key,
             )
             result = provider.list_models(models_path=draft.models_path)
+            models = [str(item) for item in result.get("models", [])]
             return {
                 "status": "ok",
                 "providerId": draft.provider_id,
                 **result,
+                "modelReasoningCapabilities": reasoning_capabilities(
+                    draft.type,
+                    models,
+                ),
             }
 
     def test_provider(self, draft: ProviderDraft) -> dict[str, Any]:
@@ -275,6 +316,7 @@ class AdminConfigManager:
                 "status": "ok",
                 "providerId": draft.provider_id,
                 "model": draft.model or "schema-sample-v1",
+                "reasoningEffort": draft.default_reasoning_effort,
                 "elapsedMs": result["elapsedMs"],
                 "usage": dict(result.get("usage") or {}),
                 "providerCallCount": int(result.get("providerCallCount") or 0),
@@ -320,6 +362,7 @@ class AdminConfigManager:
                 "type": draft.type,
                 "presetId": "mock" if draft.type == "mock" else draft.preset_id,
                 "defaultModel": model,
+                "defaultReasoningEffort": draft.default_reasoning_effort,
                 # Every successful activation starts a fresh cache namespace. This
                 # avoids sharing cached responses after an account or key change
                 # without persisting a secret-derived identifier.
@@ -380,6 +423,7 @@ class AdminConfigManager:
                 "status": "saved",
                 "providerId": draft.provider_id,
                 "model": model,
+                "reasoningEffort": draft.default_reasoning_effort,
                 "restartRequired": True,
             }
 
@@ -452,6 +496,14 @@ class AdminConfigManager:
                     else ()
                 ),
             ),
+            default_reasoning_effort=draft.default_reasoning_effort,
+        )
+        reasoning = resolve_reasoning_effort(
+            provider_type=draft.type,
+            model=model,
+            runtime_setting=None,
+            task_setting=None,
+            provider_setting=draft.default_reasoning_effort,
         )
         call_arguments = {
             "model": model,
@@ -465,6 +517,7 @@ class AdminConfigManager:
             },
             "temperature": 0,
             "max_tokens": 256,
+            "reasoning_effort": reasoning.effective,
         }
         provider_calls: list[dict[str, Any]] = []
         if draft.type == "mock":

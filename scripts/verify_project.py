@@ -24,6 +24,8 @@ ADMIN_SCRIPT_MARKERS = (
     "execution-stats?",
     "renderModelBreakdown",
     "nativeJsonSchema",
+    "modelReasoningCapabilities",
+    "defaultReasoningEffort",
 )
 
 

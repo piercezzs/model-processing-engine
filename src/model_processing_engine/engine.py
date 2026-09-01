@@ -35,10 +35,11 @@ from .providers.base import (
     ProviderTextEvent,
     ProviderTextResult,
 )
+from .reasoning import ReasoningEffort, resolve_reasoning_effort
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
-ENGINE_CACHE_SCHEMA = "mpe-cache-v2"
+ENGINE_CACHE_SCHEMA = "mpe-cache-v3"
 MAX_BATCH_CHUNKS = 1_000
 PROGRESS_PERSIST_INTERVAL_SECONDS = 0.25
 
@@ -187,17 +188,25 @@ class ModelProcessingEngine:
                 if request.runtime.max_tokens is not None
                 else request.task.runtime_defaults.max_tokens
             )
-            contract_retries = (
-                request.runtime.contract_retries
-                if request.runtime.contract_retries is not None
-                else request.task.runtime_defaults.contract_retries
-            )
             envelope["provider"] = {
                 "id": provider.config.id,
                 "type": provider.config.type,
                 "model": model,
                 "identityDigest": provider.config.digest,
             }
+            reasoning = resolve_reasoning_effort(
+                provider_type=provider.config.type,
+                model=model,
+                runtime_setting=request.runtime.reasoning_effort,
+                task_setting=request.task.runtime_defaults.reasoning_effort,
+                provider_setting=provider.config.default_reasoning_effort,
+            )
+            contract_retries = (
+                request.runtime.contract_retries
+                if request.runtime.contract_retries is not None
+                else request.task.runtime_defaults.contract_retries
+            )
+            envelope["provider"]["reasoning"] = reasoning.descriptor()
             provider_digest = str(envelope["provider"]["identityDigest"])
             cache_key = self._cache_key(
                 task=request.task,
@@ -208,6 +217,7 @@ class ModelProcessingEngine:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning.effective,
             )
             cache_allowed = request.task.cache_policy.mode != "disabled"
             progress("prepared", cacheMode=request.task.cache_policy.mode)
@@ -244,6 +254,7 @@ class ModelProcessingEngine:
                         model=model,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        reasoning_effort=reasoning.effective,
                         contract_retries=contract_retries,
                         progress=progress,
                     )
@@ -255,6 +266,7 @@ class ModelProcessingEngine:
                         component_hashes=component_hashes,
                         provider_digest=provider_digest,
                         model=model,
+                        reasoning_effort=reasoning.effective,
                         result=result,
                     )
             else:
@@ -266,6 +278,7 @@ class ModelProcessingEngine:
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning.effective,
                     contract_retries=contract_retries,
                     progress=progress,
                 )
@@ -278,6 +291,7 @@ class ModelProcessingEngine:
                         component_hashes=component_hashes,
                         provider_digest=provider_digest,
                         model=model,
+                        reasoning_effort=reasoning.effective,
                         result=result,
                     )
 
@@ -344,6 +358,13 @@ class ModelProcessingEngine:
         ).strip()
         if not model:
             raise ConfigurationError(f"Provider {provider.config.id} requires a model")
+        resolve_reasoning_effort(
+            provider_type=provider.config.type,
+            model=model,
+            runtime_setting=request.runtime.reasoning_effort,
+            task_setting=request.task.runtime_defaults.reasoning_effort,
+            provider_setting=provider.config.default_reasoning_effort,
+        )
 
     def execute_stream(
         self,
@@ -381,6 +402,13 @@ class ModelProcessingEngine:
             if request.runtime.max_tokens is not None
             else request.task.runtime_defaults.max_tokens
         )
+        reasoning = resolve_reasoning_effort(
+            provider_type=provider.config.type,
+            model=model,
+            runtime_setting=request.runtime.reasoning_effort,
+            task_setting=request.task.runtime_defaults.reasoning_effort,
+            provider_setting=provider.config.default_reasoning_effort,
+        )
         contract_retries = (
             request.runtime.contract_retries
             if request.runtime.contract_retries is not None
@@ -391,6 +419,7 @@ class ModelProcessingEngine:
             "type": provider.config.type,
             "model": model,
             "identityDigest": provider.config.digest,
+            "reasoning": reasoning.descriptor(),
         }
         envelope["cache"] = {
             "mode": "disabled",
@@ -451,6 +480,7 @@ class ModelProcessingEngine:
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning.effective,
                     repair_feedback=repair_feedback,
                     previous_output=previous_output,
                 )
@@ -585,6 +615,7 @@ class ModelProcessingEngine:
         model: str,
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None,
         contract_retries: int,
         progress: Callable[..., None],
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, int]]:
@@ -600,6 +631,7 @@ class ModelProcessingEngine:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
                 contract_retries=contract_retries,
                 progress=progress,
                 chunk_index=1,
@@ -654,6 +686,7 @@ class ModelProcessingEngine:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
                 contract_retries=contract_retries,
                 progress=progress,
                 chunk_index=index + 1,
@@ -729,6 +762,7 @@ class ModelProcessingEngine:
         model: str,
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None,
         contract_retries: int,
         progress: Callable[..., None],
         chunk_index: int,
@@ -749,6 +783,7 @@ class ModelProcessingEngine:
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                     repair_feedback=repair_feedback,
                     previous_output=previous_output,
                 )
@@ -804,6 +839,7 @@ class ModelProcessingEngine:
         model: str,
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None,
         repair_feedback: str | None,
         previous_output: dict[str, Any] | str | None,
     ) -> ProviderCallResult:
@@ -823,6 +859,7 @@ class ModelProcessingEngine:
                     output_schema=task.output_schema,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                     repair_feedback=repair_feedback,
                     previous_output=previous_output,
                 )
@@ -843,6 +880,7 @@ class ModelProcessingEngine:
                     "sequence": sequence,
                     "providerId": provider.config.id,
                     "model": model,
+                    "reasoningEffort": reasoning_effort or "auto",
                     "status": "failed",
                     "usage": usage,
                     "attempts": attempts,
@@ -859,6 +897,7 @@ class ModelProcessingEngine:
                 "sequence": sequence,
                 "providerId": provider.config.id,
                 "model": model,
+                "reasoningEffort": reasoning_effort or "auto",
                 "status": "succeeded",
                 "usage": call.usage,
                 "attempts": call.attempts,
@@ -880,6 +919,7 @@ class ModelProcessingEngine:
         model: str,
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None,
         repair_feedback: str | None,
         previous_output: str | None,
     ) -> Iterator[ProviderTextEvent]:
@@ -896,6 +936,7 @@ class ModelProcessingEngine:
                     input_payload=model_payload,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                     repair_feedback=repair_feedback,
                     previous_output=previous_output,
                 ):
@@ -913,6 +954,7 @@ class ModelProcessingEngine:
                     "sequence": sequence,
                     "providerId": provider.config.id,
                     "model": model,
+                    "reasoningEffort": reasoning_effort or "auto",
                     "status": "cancelled",
                     "usage": {},
                     "attempts": 0,
@@ -938,6 +980,7 @@ class ModelProcessingEngine:
                     "sequence": sequence,
                     "providerId": provider.config.id,
                     "model": model,
+                    "reasoningEffort": reasoning_effort or "auto",
                     "status": "failed",
                     "usage": usage,
                     "attempts": attempts,
@@ -954,6 +997,7 @@ class ModelProcessingEngine:
                 "sequence": sequence,
                 "providerId": provider.config.id,
                 "model": model,
+                "reasoningEffort": reasoning_effort or "auto",
                 "status": "succeeded",
                 "usage": completed.usage,
                 "attempts": completed.attempts,
@@ -973,6 +1017,7 @@ class ModelProcessingEngine:
         model: str,
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None,
     ) -> str:
         policy = task.cache_policy
         if policy.mode == "semantic":
@@ -998,6 +1043,7 @@ class ModelProcessingEngine:
                 "model": model,
                 "temperature": temperature,
                 "maxTokens": max_tokens,
+                "reasoningEffort": reasoning_effort,
                 "input": input_identity,
             }
         )
@@ -1023,6 +1069,7 @@ class ModelProcessingEngine:
         component_hashes: dict[str, str],
         provider_digest: str,
         model: str,
+        reasoning_effort: ReasoningEffort | None,
         result: dict[str, Any],
     ) -> None:
         self.store.put_cache(
@@ -1038,6 +1085,7 @@ class ModelProcessingEngine:
                 "taskDigest": task_digest,
                 "componentHashes": component_hashes,
                 "providerIdentityDigest": provider_digest,
+                "reasoningEffort": reasoning_effort,
             },
             ttl_seconds=task.cache_policy.ttl_seconds,
         )

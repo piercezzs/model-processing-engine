@@ -16,6 +16,7 @@
   "runtimeDefaults": {
     "providerId": "mock",
     "model": "schema-sample-v1",
-    "temperature": 0.1
+    "temperature": 0.1,
+    "reasoningEffort": "auto"
   }
 }

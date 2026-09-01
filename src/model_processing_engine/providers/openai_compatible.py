@@ -15,6 +15,7 @@ from model_processing_engine.exceptions import (
     ProviderError,
     ProviderNonJsonContentError,
 )
+from model_processing_engine.reasoning import ReasoningEffort
 
 from .base import (
     ProviderCallResult,
@@ -49,6 +50,7 @@ class OpenAICompatibleProvider:
         output_schema: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None = None,
         repair_feedback: str | None = None,
         previous_output: dict[str, Any] | str | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -109,8 +111,17 @@ class OpenAICompatibleProvider:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
         if extra_body:
-            protected = {"model", "messages", "temperature", "response_format", "max_tokens"}
+            protected = {
+                "model",
+                "messages",
+                "temperature",
+                "response_format",
+                "max_tokens",
+                "reasoning_effort",
+            }
             collisions = protected.intersection(extra_body)
             if collisions:
                 raise ConfigurationError(
@@ -165,6 +176,7 @@ class OpenAICompatibleProvider:
         input_payload: dict[str, Any],
         temperature: float,
         max_tokens: int | None,
+        reasoning_effort: ReasoningEffort | None = None,
         repair_feedback: str | None = None,
         previous_output: str | None = None,
     ) -> Iterator[ProviderTextEvent]:
@@ -206,6 +218,8 @@ class OpenAICompatibleProvider:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
         request = urllib.request.Request(
             self._url(),
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

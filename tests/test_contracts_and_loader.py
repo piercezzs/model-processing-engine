@@ -34,6 +34,25 @@ class ContractAndLoaderTests(unittest.TestCase):
                 }
             )
 
+    def test_runtime_reasoning_effort_uses_api_native_values(self) -> None:
+        task = task_definition()
+        request = ExecutionRequest.model_validate(
+            {
+                "task": task.model_dump(by_alias=True),
+                "input": {"text": "hello"},
+                "runtime": {"reasoningEffort": "xhigh"},
+            }
+        )
+        self.assertEqual(request.runtime.reasoning_effort, "xhigh")
+        with self.assertRaises(ValidationError):
+            ExecutionRequest.model_validate(
+                {
+                    "task": task.model_dump(by_alias=True),
+                    "input": {"text": "hello"},
+                    "runtime": {"reasoningEffort": "ultra"},
+                }
+            )
+
     def test_sensitive_task_rejects_async_execution(self) -> None:
         task = task_definition(cache_policy={"mode": "disabled", "sensitive": True})
         with self.assertRaises(ValidationError):

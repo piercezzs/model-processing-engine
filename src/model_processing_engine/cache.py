@@ -92,6 +92,7 @@ class SQLiteRuntimeStore:
                     sequence INTEGER NOT NULL,
                     provider_id TEXT NOT NULL,
                     model TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL DEFAULT 'auto',
                     status TEXT NOT NULL,
                     usage_json TEXT NOT NULL,
                     attempts INTEGER NOT NULL,
@@ -502,9 +503,9 @@ class SQLiteRuntimeStore:
                 """
                 INSERT INTO provider_call_records (
                     call_id, execution_id, purpose, sequence, provider_id,
-                    model, status, usage_json, attempts, elapsed_ms, error,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model, reasoning_effort, status, usage_json, attempts,
+                    elapsed_ms, error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     call_id,
@@ -513,6 +514,7 @@ class SQLiteRuntimeStore:
                     max(1, int(record.get("sequence") or 1)),
                     str(record.get("providerId") or ""),
                     str(record.get("model") or ""),
+                    str(record.get("reasoningEffort") or "auto"),
                     str(record.get("status") or "failed"),
                     _json_text(usage),
                     _non_negative_int(record.get("attempts")),
@@ -742,6 +744,16 @@ def _migrate_execution_history_schema(connection: sqlite3.Connection) -> None:
                 f"ALTER TABLE execution_records ADD COLUMN {name} {definition}"
             )
 
+    provider_call_columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(provider_call_records)").fetchall()
+    }
+    if "reasoning_effort" not in provider_call_columns:
+        connection.execute(
+            "ALTER TABLE provider_call_records "
+            "ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'auto'"
+        )
+
     rows = connection.execute(
         """
         SELECT execution_id, envelope_json, kind, provider_id, model
@@ -866,6 +878,11 @@ def _execution_summary(
         if isinstance(envelope.get("provider"), dict)
         else {}
     )
+    reasoning = (
+        provider.get("reasoning")
+        if isinstance(provider.get("reasoning"), dict)
+        else {}
+    )
     cache = envelope.get("cache") if isinstance(envelope.get("cache"), dict) else {}
     usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
     timing = envelope.get("timing") if isinstance(envelope.get("timing"), dict) else {}
@@ -903,6 +920,15 @@ def _execution_summary(
         "provider": {
             "id": str(provider.get("id") or ""),
             "model": str(provider.get("model") or ""),
+            "reasoning": {
+                "requested": str(reasoning.get("requested") or "auto"),
+                "effective": (
+                    str(reasoning["effective"])
+                    if reasoning.get("effective") is not None
+                    else None
+                ),
+                "source": str(reasoning.get("source") or ""),
+            },
         },
         "cache": {
             "hit": bool(cache.get("hit")),
