@@ -4,9 +4,8 @@ from pathlib import Path
 
 from .cache import SQLiteRuntimeStore
 from .engine import ModelProcessingEngine
+from .providers import default_provider_factories
 from .providers.base import load_provider_registry
-from .providers.mock import MockProvider
-from .providers.openai_compatible import OpenAICompatibleProvider
 from .settings import Settings, load_settings
 
 
@@ -19,10 +18,7 @@ def build_default_engine(
     runtime = settings or load_settings(root)
     providers = load_provider_registry(
         runtime.provider_config_path,
-        factories={
-            "mock": MockProvider,
-            "openai_compatible": OpenAICompatibleProvider,
-        },
+        factories=default_provider_factories(),
     )
     store = SQLiteRuntimeStore(runtime.database_path)
     if recover_incomplete:

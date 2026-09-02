@@ -50,6 +50,13 @@ python3 -m venv .venv
 uv sync --locked --extra dev
 ```
 
+只有明确需要把任务转交给本机已登录 Codex 的设备，才安装可选 Codex SDK
+适配器：
+
+```bash
+uv sync --locked --extra dev --extra codex
+```
+
 如需一键完成本地配置并启动托管服务，请使用对应平台的启动脚本：
 
 ```bash
@@ -381,6 +388,8 @@ at-least-once；已经存在终态快照的任务不会再次执行。多个可�
 - `mock`：根据 Schema 生成确定性结果，用于测试和集成配置。
 - `openai_compatible`：使用 JSON 和纯文本 SSE Chat Completions 传输，并对限流、
   服务器错误、超时和连接失败执行有限次数的重试。
+- `codex_sdk`：可选的本地 Codex App Server 结构化 JSON 委托适配器。它可以使用
+  Codex Web Search，而不要求 MPE 自己实现完整 Agent Harness。
 
 OpenAI-compatible 的正常响应体和错误响应体均使用 8 MiB 硬上限读取。模型执行和
 模型发现都会在 JSON 解码前应用该限制，避免配置错误或恶意端点通过无界响应耗尽
@@ -399,6 +408,22 @@ Provider 的严格 JSON Schema 请求字段发送任务输出 Schema，只应为
 Provider 配置通过环境变量名引用凭证。不得将凭证写入 Task Pack、请求载荷或已
 提交文件。为每个账号/端点上下文设置一个非秘密 `cacheIdentity`；上下文改变时应
 递增该值，因为它会参与技术缓存身份计算。
+
+实验性的 `codex_sdk` 目前只支持手工配置，管理页面尚不能创建、检测或编辑它。
+安装 `codex` 可选依赖后，可从 `examples/providers.codex.json` 开始配置。适配器
+复用本机 Codex 登录（ChatGPT 订阅登录或 Codex 支持的 API 登录），不会复用
+OpenAI-compatible 网关 Key。每次 turn 都是 ephemeral、拒绝审批、只读，并在空的
+临时目录运行。`webSearch` 可设为 `disabled`、`cached`、`indexed` 或 `live`；
+成功调用会在 usage 和 Provider 调用审计中记录 `webSearchCalls`。当前 SDK 接口
+没有暴露 MPE 的 `temperature` 和 `maxTokens` 控制，此适配器也不支持文本流式
+输出。需要等待 Codex SDK 返回真实终态或错误的长任务可把 `timeoutSeconds` 设为
+`0`；正数仍保留原有墙钟保护并在到达上限时尽力中断当前 turn。只有
+`codex_sdk` 支持这个零值语义。
+
+Codex App Server 会在本机 Codex 主目录初始化状态，因此外层沙箱需要允许正常的
+Codex 状态访问；被委托的 turn 本身仍保持只读。模型结果继续是建议性输出：MPE
+在处理 SDK Schema 提示兼容后，仍会用 Task Pack 的原始完整 Schema 做最终校验，
+持久化写入权仍只属于调用项目。
 
 ## 安全
 

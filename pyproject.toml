@@ -17,6 +17,9 @@ dev = [
   "httpx2>=2.3,<3",
   "pyyaml>=6.0.2,<7",
 ]
+codex = [
+  "openai-codex>=0.147.0,<1",
+]
 
 [project.scripts]
 mpe = "model_processing_engine.cli:main"

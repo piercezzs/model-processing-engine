@@ -1217,7 +1217,14 @@ def _merge_batch_outputs(calls: list[ProviderCallResult], *, output_field: str) 
 
 
 def _merge_usage(calls: list[ProviderCallResult]) -> dict[str, Any]:
-    fields = ["inputTokens", "outputTokens", "totalTokens", "cacheReadInputTokens"]
+    fields = [
+        "inputTokens",
+        "outputTokens",
+        "totalTokens",
+        "cacheReadInputTokens",
+        "reasoningOutputTokens",
+        "webSearchCalls",
+    ]
     return {
         "available": any(bool(call.usage.get("available")) for call in calls),
         **{

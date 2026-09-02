@@ -20,9 +20,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_TASK = PROJECT_ROOT / "examples" / "tasks" / "generic_summary"
 ADMIN_SCRIPT_MARKERS = (
     "historyProviderCacheTokens",
+    "historyUncachedInputTokens",
     "historyTransportRetries",
     "execution-stats?",
     "renderModelBreakdown",
+    "tokenBreakdown",
     "nativeJsonSchema",
     "modelReasoningCapabilities",
     "defaultReasoningEffort",
@@ -242,6 +244,28 @@ def _verify_runtime_surface(environment: Mapping[str, str]) -> None:
     for field in ("queued", "running", "total", "capacity", "workers"):
         if field not in async_queue:
             raise VerificationError(f"health endpoint omitted asyncQueue.{field}")
+
+    admin_config, _headers = _read_json(f"{base_url}/v1/admin/config")
+    config = admin_config.get("config")
+    if not isinstance(config, dict):
+        raise VerificationError("admin config endpoint omitted config")
+    providers = config.get("providers")
+    if not isinstance(providers, list):
+        raise VerificationError("admin config endpoint omitted providers")
+    configured_ids = {
+        str(provider.get("id") or "")
+        for provider in providers
+        if isinstance(provider, dict)
+    }
+    if not set(health.get("providers") or []).issubset(configured_ids):
+        raise VerificationError("admin config endpoint omitted a runtime Provider")
+    for provider in providers:
+        if (
+            isinstance(provider, dict)
+            and provider.get("type") == "codex_sdk"
+            and provider.get("editable") is not False
+        ):
+            raise VerificationError("admin config exposed codex_sdk as editable")
 
     history, _headers = _read_json(
         f"{base_url}/v1/admin/executions?limit=1"

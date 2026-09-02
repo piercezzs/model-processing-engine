@@ -100,12 +100,35 @@ _OPENAI_CHAT_COMPLETIONS_RULES: tuple[_CapabilityRule, ...] = (
     ),
 )
 
+_CODEX_SDK_RULES: tuple[_CapabilityRule, ...] = (
+    _CapabilityRule(
+        pattern=re.compile(r"^gpt-5\.6-(?:sol|terra|luna)(?:$|[-.])", re.IGNORECASE),
+        capability=ModelReasoningCapability(
+            supported_efforts=("none", "low", "medium", "high", "xhigh"),
+            model_default="medium",
+            wire_parameter="effort",
+        ),
+    ),
+    _CapabilityRule(
+        pattern=re.compile(r"^gpt-5\.5(?:$|[-.])", re.IGNORECASE),
+        capability=ModelReasoningCapability(
+            supported_efforts=("none", "low", "medium", "high", "xhigh"),
+            model_default="medium",
+            wire_parameter="effort",
+        ),
+    ),
+)
+
 
 def reasoning_capability(provider_type: str, model: str) -> ModelReasoningCapability:
-    if provider_type != "openai_compatible":
+    rules = {
+        "openai_compatible": _OPENAI_CHAT_COMPLETIONS_RULES,
+        "codex_sdk": _CODEX_SDK_RULES,
+    }.get(provider_type)
+    if rules is None:
         return ModelReasoningCapability()
     normalized_model = model.strip()
-    for rule in _OPENAI_CHAT_COMPLETIONS_RULES:
+    for rule in rules:
         if rule.pattern.match(normalized_model):
             return rule.capability
     return ModelReasoningCapability()
@@ -162,4 +185,3 @@ def resolve_reasoning_effort(
         source=source,
         wire_parameter=capability.wire_parameter,
     )
-

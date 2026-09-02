@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from .exceptions import ConfigurationError, ProviderEmptyContentError, ProviderError
 from .file_store import atomic_write_text
 from .project_environment import read_env_file, update_project_environment
+from .providers import default_provider_factories
 from .providers.base import ProviderCallResult, ProviderConfig, load_provider_registry_data
 from .providers.mock import MockProvider
 from .providers.openai_compatible import OpenAICompatibleProvider
@@ -31,6 +32,7 @@ from .reasoning import (
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TEST_TOKEN_TTL_SECONDS = 300
 MAX_PROVIDER_CONFIG_BYTES = 256 * 1024
+ADMIN_EDITABLE_PROVIDER_TYPES = frozenset({"mock", "openai_compatible"})
 ProviderPresetId = Literal["openai", "deepseek", "custom", "mock"]
 
 PROVIDER_PRESETS: tuple[dict[str, Any], ...] = (
@@ -198,15 +200,17 @@ class AdminConfigManager:
             for provider_id, value in sorted(dict(raw.get("providers") or {}).items()):
                 if not isinstance(value, dict):
                     continue
+                provider_type = str(value.get("type") or "")
                 credential_env = str(value.get("apiKeyEnv") or "")
                 providers.append(
                     {
                         "id": str(provider_id),
-                        "type": str(value.get("type") or ""),
+                        "type": provider_type,
+                        "editable": provider_type in ADMIN_EDITABLE_PROVIDER_TYPES,
                         "presetId": str(
                             value.get("presetId")
                             or _infer_preset_id(
-                                str(value.get("type") or ""),
+                                provider_type,
                                 str(value.get("baseUrl") or ""),
                             )
                         ),
@@ -223,14 +227,18 @@ class AdminConfigManager:
                             value.get("defaultReasoningEffort") or "auto"
                         ),
                         "modelReasoningCapabilities": reasoning_capabilities(
-                            str(value.get("type") or ""),
+                            provider_type,
                             [
                                 str(item) for item in value.get("availableModels", [])
                                 if str(item).strip()
                             ]
                             + [str(value.get("defaultModel") or "")],
                         ),
-                        "timeoutSeconds": int(value.get("timeoutSeconds") or 60),
+                        "timeoutSeconds": int(
+                            value.get("timeoutSeconds")
+                            if value.get("timeoutSeconds") is not None
+                            else 60
+                        ),
                         "transportRetries": int(
                             value.get("transportRetries")
                             if value.get("transportRetries") is not None
@@ -244,6 +252,10 @@ class AdminConfigManager:
                                 for item in value.get("capabilities", [])
                             }
                         ),
+                        "capabilities": [
+                            str(item) for item in value.get("capabilities", [])
+                        ],
+                        "webSearch": str(value.get("webSearch") or "disabled"),
                         "credentialConfigured": bool(
                             credential_env and env_values.get(credential_env, "").strip()
                         ),
@@ -445,10 +457,7 @@ class AdminConfigManager:
     def _validate_provider_config(self, raw: dict[str, Any]) -> None:
         load_provider_registry_data(
             raw,
-            factories={
-                "mock": MockProvider,
-                "openai_compatible": OpenAICompatibleProvider,
-            },
+            factories=default_provider_factories(),
         )
 
     def _resolved_api_key(self, draft: ProviderConnectionDraft) -> str:

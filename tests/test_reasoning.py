@@ -31,6 +31,14 @@ class ReasoningCapabilityTests(unittest.TestCase):
             reasoning_capability("openai_compatible", "future-model").configurable
         )
 
+    def test_codex_sdk_uses_effort_contract_without_unsupported_max(self) -> None:
+        capability = reasoning_capability("codex_sdk", "gpt-5.6-sol")
+        self.assertEqual(
+            capability.supported_efforts,
+            ("none", "low", "medium", "high", "xhigh"),
+        )
+        self.assertEqual(capability.wire_parameter, "effort")
+
     def test_runtime_precedence_and_auto_omission(self) -> None:
         runtime = resolve_reasoning_effort(
             provider_type="openai_compatible",

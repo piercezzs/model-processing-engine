@@ -330,6 +330,44 @@ class AdminConfigManagerTests(unittest.TestCase):
             self.assertEqual(snapshot["providers"][0]["presetId"], "deepseek")
             self.assertEqual(snapshot["providerPresets"][0]["id"], "openai")
 
+    def test_snapshot_accepts_codex_sdk_as_read_only_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = self._project(Path(temp_dir))
+            config_path = project / "config" / "providers.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaultProviderId": "codex-local",
+                        "providers": {
+                            "codex-local": {
+                                "type": "codex_sdk",
+                                "defaultModel": "gpt-5.6-sol",
+                                "availableModels": ["gpt-5.6-sol"],
+                                "defaultReasoningEffort": "medium",
+                                "capabilities": ["structured_json", "web_search"],
+                                "webSearch": "live",
+                                "timeoutSeconds": 0,
+                                "transportRetries": 0,
+                                "maxConcurrency": 1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = AdminConfigManager(project).snapshot()
+
+            self.assertEqual(snapshot["activeProviderId"], "codex-local")
+            provider = snapshot["providers"][0]
+            self.assertFalse(provider["editable"])
+            self.assertTrue(provider["active"])
+            self.assertEqual(provider["type"], "codex_sdk")
+            self.assertEqual(provider["timeoutSeconds"], 0)
+            self.assertEqual(provider["webSearch"], "live")
+            self.assertIn("web_search", provider["capabilities"])
+
     def test_apply_rejects_a_changed_or_reused_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = AdminConfigManager(self._project(Path(temp_dir)))

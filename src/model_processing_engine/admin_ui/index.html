@@ -117,6 +117,7 @@
                 <select id="provider-type" name="providerType">
                   <option value="openai_compatible">OpenAI Chat Completions</option>
                   <option value="mock">Mock（离线测试）</option>
+                  <option value="codex_sdk" disabled>Codex SDK（本机订阅，只读）</option>
                 </select>
               </label>
               <label class="field">
@@ -179,7 +180,7 @@
         <div>
           <p class="section-label">EXECUTION HISTORY</p>
           <h2 id="history-title">模型调用记录</h2>
-          <p>按时间、模型和调用项目查看执行、Token、缓存与异常情况。</p>
+          <p>按时间、模型和调用项目查看执行、累计输入、缓存拆分与异常情况。</p>
         </div>
         <button class="compact-button" id="refresh-history" type="button">刷新记录</button>
       </div>
@@ -232,14 +233,19 @@
           <small id="history-transport-retries">0 次合同修复 · 0 次重试</small>
         </div>
         <div class="history-metric">
-          <span>总 Token</span>
+          <span>累计输入</span>
           <strong id="history-tokens">0</strong>
-          <small id="history-usage-coverage">输入 0 · 输出 0</small>
+          <small id="history-usage-coverage">输出 0 · 总计 0</small>
         </div>
         <div class="history-metric">
-          <span>Prompt Cache</span>
+          <span>缓存输入</span>
           <strong id="history-provider-cache-tokens">0</strong>
           <small id="history-provider-cache-coverage">0 条命中 · 0.0% 输入</small>
+        </div>
+        <div class="history-metric">
+          <span>非缓存输入</span>
+          <strong id="history-uncached-input-tokens">0</strong>
+          <small id="history-uncached-input-coverage">0.0% 输入</small>
         </div>
         <div class="history-metric">
           <span>MPE 结果缓存</span>
@@ -278,7 +284,7 @@
                   <th>执行</th>
                   <th>调用</th>
                   <th>成功率</th>
-                  <th>Token</th>
+                  <th>累计输入</th>
                 </tr>
               </thead>
               <tbody id="history-model-table"></tbody>

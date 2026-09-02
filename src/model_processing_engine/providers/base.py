@@ -31,6 +31,7 @@ class ProviderConfig:
     available_models: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ("structured_json",)
     default_reasoning_effort: ReasoningEffortSetting = "auto"
+    web_search: str = "disabled"
 
     @property
     def identity(self) -> dict[str, Any]:
@@ -42,6 +43,7 @@ class ProviderConfig:
             "cacheIdentity": self.cache_identity,
             "capabilities": list(self.capabilities),
             "defaultReasoningEffort": self.default_reasoning_effort,
+            "webSearch": self.web_search,
         }
 
     @property
@@ -192,9 +194,25 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ConfigurationError(f"Provider {provider_id} baseUrl must be an HTTP(S) URL")
-    timeout = int(value.get("timeoutSeconds") or 60)
+    web_search = str(value.get("webSearch") or "disabled").strip().casefold()
+    if provider_type == "codex_sdk" and web_search not in {
+        "disabled",
+        "cached",
+        "indexed",
+        "live",
+    }:
+        raise ConfigurationError(
+            f"Provider {provider_id} webSearch must be disabled, cached, indexed, or live"
+        )
+    raw_timeout = value.get("timeoutSeconds")
+    timeout = 60 if raw_timeout is None else int(raw_timeout)
     retries = int(value.get("transportRetries") if value.get("transportRetries") is not None else 2)
-    if not 1 <= timeout <= 600:
+    if provider_type == "codex_sdk":
+        if not 0 <= timeout <= 86_400:
+            raise ConfigurationError(
+                f"Provider {provider_id} timeoutSeconds must be 0-86400 for codex_sdk"
+            )
+    elif not 1 <= timeout <= 600:
         raise ConfigurationError(f"Provider {provider_id} timeoutSeconds must be 1-600")
     if not 0 <= retries <= 5:
         raise ConfigurationError(f"Provider {provider_id} transportRetries must be 0-5")
@@ -239,6 +257,7 @@ def _provider_config(provider_id: str, value: dict[str, Any]) -> ProviderConfig:
         available_models=available_models,
         capabilities=capabilities,
         default_reasoning_effort=default_reasoning_effort,
+        web_search=web_search,
     )
 
 

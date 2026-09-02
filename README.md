@@ -53,6 +53,13 @@ python3 -m venv .venv
 uv sync --locked --extra dev
 ```
 
+Install the optional Codex SDK adapter only on hosts that intentionally delegate
+tasks to a locally authenticated Codex client:
+
+```bash
+uv sync --locked --extra dev --extra codex
+```
+
 For one-click local setup and managed service startup, use the platform wrapper:
 
 ```bash
@@ -446,6 +453,8 @@ ID, and process ID so local service management can verify process identity.
 - `mock`: deterministic schema-derived output for tests and integration setup.
 - `openai_compatible`: JSON and plain-text SSE chat-completions transport with
   bounded retry for rate-limit, server, timeout, and connection failures.
+- `codex_sdk`: optional structured-JSON delegation to a local Codex App Server.
+  It can enable Codex Web Search without turning MPE itself into an agent harness.
 
 OpenAI-compatible response and error bodies are read with an 8 MiB hard limit.
 This bound applies to both model execution and model discovery before JSON
@@ -469,6 +478,26 @@ Credentials are referenced by environment-variable name in provider config.
 They must never be placed in Task Packs, request payloads, or committed files.
 Set a non-secret `cacheIdentity` per account/endpoint context and increment it
 when that context changes; the value participates in technical cache identity.
+
+The experimental `codex_sdk` adapter is configured manually; it is not yet
+created, tested, or edited by the management page. Install the `codex` optional
+dependency and start from `examples/providers.codex.json`. The adapter reuses the
+local Codex login (ChatGPT subscription or a Codex-supported API login) and does
+not reuse an OpenAI-compatible gateway key. Each turn is ephemeral, deny-all for
+approvals, read-only, and runs in an empty temporary directory. `webSearch` may be
+`disabled`, `cached`, `indexed`, or `live`; successful calls report
+`webSearchCalls` in usage and the Provider-call audit. The current SDK surface
+does not expose MPE's `temperature` or `maxTokens` controls, and this adapter does
+not support text streaming. Set `timeoutSeconds` to `0` for long-running Codex
+tasks that must wait for the SDK's real terminal result or error. A positive
+value keeps the existing wall-clock guard and triggers a best-effort turn
+interrupt when reached; this zero value is supported only by `codex_sdk`.
+
+Codex App Server initializes state under the local Codex home. A parent sandbox
+must therefore permit that normal Codex state access, even though the delegated
+turn itself remains read-only. Model results are still advisory: MPE validates
+the original complete Task Pack schema after any SDK-specific schema hint
+adaptation, and the caller remains the only durable write owner.
 
 ## Security
 

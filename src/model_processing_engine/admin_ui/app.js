@@ -2,6 +2,9 @@
 
 const API_BASE = "/v1/admin";
 const MANUAL_MODEL = "__manual__";
+const READ_ONLY_PRESET = "__read_only__";
+const DEFAULT_SECURITY_NOTICE =
+  "Key 只会在测试成功后写入项目根目录的 .env，页面不会读取或显示已有 Key 明文。";
 
 const state = {
   csrfToken: "",
@@ -50,6 +53,7 @@ const elements = {
   transportRetries: document.querySelector("#transport-retries"),
   nativeJsonSchema: document.querySelector("#native-json-schema"),
   remoteFields: document.querySelector("#remote-fields"),
+  securityNotice: document.querySelector("#security-notice"),
   resultBox: document.querySelector("#result-box"),
   testProvider: document.querySelector("#test-provider"),
   applyProvider: document.querySelector("#apply-provider"),
@@ -62,6 +66,8 @@ const elements = {
   historyCacheHits: document.querySelector("#history-cache-hits"),
   historyProviderCacheTokens: document.querySelector("#history-provider-cache-tokens"),
   historyProviderCacheCoverage: document.querySelector("#history-provider-cache-coverage"),
+  historyUncachedInputTokens: document.querySelector("#history-uncached-input-tokens"),
+  historyUncachedInputCoverage: document.querySelector("#history-uncached-input-coverage"),
   historyProviderCalls: document.querySelector("#history-provider-calls"),
   historyTransportRetries: document.querySelector("#history-transport-retries"),
   historyStatusSummary: document.querySelector("#history-status-summary"),
@@ -132,6 +138,18 @@ function formatRatio(numerator, denominator) {
   }
   const value = Math.max(0, Number(numerator) || 0);
   return `${((value / total) * 100).toFixed(1)}%`;
+}
+
+function tokenBreakdown(usage = {}) {
+  const input = Math.max(0, Number(usage.inputTokens) || 0);
+  const cached = Math.min(input, Math.max(0, Number(usage.cacheReadInputTokens) || 0));
+  return {
+    input,
+    cached,
+    uncached: Math.max(0, input - cached),
+    output: Math.max(0, Number(usage.outputTokens) || 0),
+    total: Math.max(0, Number(usage.totalTokens) || 0),
+  };
 }
 
 function formatHistoryTime(value) {
@@ -392,9 +410,7 @@ function renderModelBreakdown(models) {
     successRate.className = "model-success-rate";
     successRate.textContent = `${Number(item.successRate || 0).toFixed(1)}%`;
     const tokens = document.createElement("td");
-    tokens.textContent = compactNumberFormatter.format(
-      Math.max(0, Number(item.usage?.totalTokens) || 0),
-    );
+    tokens.textContent = compactNumberFormatter.format(tokenBreakdown(item.usage).input);
     row.append(identityCell, executions, calls, successRate, tokens);
     elements.historyModelTable.append(row);
   }
@@ -403,17 +419,21 @@ function renderModelBreakdown(models) {
 function renderHistoryStatistics(payload) {
   const summary = payload.summary || {};
   const usage = summary.usage || {};
+  const breakdown = tokenBreakdown(usage);
   elements.historyTotal.textContent = formatNumber(summary.total);
-  elements.historyTokens.textContent = formatNumber(usage.totalTokens);
+  elements.historyTokens.textContent = formatNumber(breakdown.input);
   elements.historyUsageCoverage.textContent =
-    `输入 ${formatNumber(usage.inputTokens)} · 输出 ${formatNumber(usage.outputTokens)}`;
+    `输出 ${formatNumber(breakdown.output)} · 总计 ${formatNumber(breakdown.total)}`;
   elements.historyCacheHits.textContent = formatNumber(summary.cacheHits);
   elements.historyCacheCoverage.textContent =
     `${formatNumber(summary.cacheHits)} 次跳过 Provider`;
-  elements.historyProviderCacheTokens.textContent = formatNumber(usage.cacheReadInputTokens);
+  elements.historyProviderCacheTokens.textContent = formatNumber(breakdown.cached);
   elements.historyProviderCacheCoverage.textContent =
     `${formatNumber(summary.providerCacheHitExecutions)} 条命中 · ` +
-    `${formatRatio(usage.cacheReadInputTokens, usage.inputTokens)} 输入`;
+    `${formatRatio(breakdown.cached, breakdown.input)} 输入`;
+  elements.historyUncachedInputTokens.textContent = formatNumber(breakdown.uncached);
+  elements.historyUncachedInputCoverage.textContent =
+    `${formatRatio(breakdown.uncached, breakdown.input)} 输入`;
   elements.historyProviderCalls.textContent = formatNumber(summary.providerCallCount);
   elements.historyTransportRetries.textContent =
     `${formatNumber(summary.contractRepairs)} 次合同修复 · ` +
@@ -476,21 +496,29 @@ function renderHistory(payload) {
 
     const usageCell = document.createElement("div");
     usageCell.className = "history-usage";
+    const breakdown = tokenBreakdown(item.usage);
     const tokenCount = document.createElement("strong");
     tokenCount.textContent = item.usage?.available
-      ? `${formatNumber(item.usage.totalTokens)} Token`
+      ? `累计输入 ${formatNumber(breakdown.input)}`
       : "Token 未提供";
+    usageCell.append(tokenCount);
+    if (item.usage?.available) {
+      const inputSplit = document.createElement("span");
+      inputSplit.textContent =
+        `缓存 ${formatNumber(breakdown.cached)} · 非缓存 ${formatNumber(breakdown.uncached)}`;
+      const output = document.createElement("span");
+      output.textContent =
+        `输出 ${formatNumber(breakdown.output)} · 总计 ${formatNumber(breakdown.total)}`;
+      usageCell.append(inputSplit, output);
+    }
     const elapsed = document.createElement("span");
     elapsed.textContent = formatDuration(item.timing?.elapsedMs);
-    usageCell.append(tokenCount, elapsed);
+    usageCell.append(elapsed);
 
     const auditCell = document.createElement("div");
     auditCell.className = "history-audit";
     const auditState = document.createElement("strong");
-    const providerCacheTokens = Math.max(
-      0,
-      Number(item.usage?.cacheReadInputTokens) || 0,
-    );
+    const providerCacheTokens = breakdown.cached;
     if (item.cache?.hit) {
       auditState.textContent = "MPE 结果缓存命中";
     } else if (item.timing?.contractRepairs) {
@@ -628,9 +656,40 @@ function renderPresetOptions() {
 }
 
 function providerLabel(provider) {
+  if (provider.type === "codex_sdk") {
+    return `本机 Codex 订阅 · ${provider.defaultModel || "未设置模型"}`;
+  }
   const preset = presetById(provider.presetId);
   const model = provider.defaultModel || (provider.type === "mock" ? "离线测试" : "未设置模型");
   return preset ? `${preset.label} · ${model}` : model;
+}
+
+function setProviderFormReadOnly(readOnly) {
+  const controls = [...elements.form.elements];
+  for (const control of controls) {
+    control.disabled = readOnly;
+  }
+  elements.form.classList.toggle("read-only", readOnly);
+  elements.testProvider.hidden = readOnly;
+  elements.applyProvider.hidden = readOnly;
+  elements.securityNotice.textContent = readOnly
+    ? "此配置使用本机 Codex 登录态，不读取或保存 API Key；如需调整，请修改本机 Provider 配置并重启 MPE。"
+    : DEFAULT_SECURITY_NOTICE;
+}
+
+function renderProviderPreset(provider) {
+  elements.providerPreset.querySelector(`option[value="${READ_ONLY_PRESET}"]`)?.remove();
+  if (provider.editable === false) {
+    const option = document.createElement("option");
+    option.value = READ_ONLY_PRESET;
+    option.textContent = provider.type === "codex_sdk"
+      ? "本机 Codex 订阅"
+      : `${provider.type}（只读）`;
+    elements.providerPreset.append(option);
+    elements.providerPreset.value = READ_ONLY_PRESET;
+    return;
+  }
+  elements.providerPreset.value = provider.presetId;
 }
 
 function renderProviderList() {
@@ -740,9 +799,11 @@ function selectProvider(providerId) {
   if (!provider) {
     return;
   }
+  const readOnly = provider.editable === false;
+  setProviderFormReadOnly(false);
   state.selectedProviderId = provider.id;
   state.verificationToken = "";
-  elements.providerPreset.value = provider.presetId;
+  renderProviderPreset(provider);
   elements.providerType.value = provider.type;
   elements.providerId.value = provider.id;
   elements.baseUrl.value = provider.baseUrl;
@@ -758,12 +819,20 @@ function selectProvider(providerId) {
     ? "Key 已配置；留空将使用现有值"
     : "尚未配置 Key";
   elements.activeBadge.hidden = !provider.active;
-  elements.editorTitle.textContent = `配置 ${provider.id}`;
+  elements.editorTitle.textContent = `${readOnly ? "查看" : "配置"} ${provider.id}`;
   elements.applyProvider.disabled = true;
   renderModelOptions(provider.availableModels, provider.defaultModel);
   renderReasoningOptions(provider.defaultReasoningEffort || "auto");
-  updateProviderType();
-  setResult("修改配置后，请先测试连接。", "neutral");
+  updateProviderType({readOnly});
+  if (readOnly) {
+    setProviderFormReadOnly(true);
+    setResult(
+      `本机 Codex 订阅配置仅供查看；联网检索为 ${provider.webSearch || "disabled"}，不通过管理页修改。`,
+      "neutral",
+    );
+  } else {
+    setResult("修改配置后，请先测试连接。", "neutral");
+  }
   renderProviderList();
 }
 
@@ -787,6 +856,8 @@ function applyPreset(presetId, {updateProviderId = false} = {}) {
 }
 
 function newProvider() {
+  setProviderFormReadOnly(false);
+  elements.providerPreset.querySelector(`option[value="${READ_ONLY_PRESET}"]`)?.remove();
   state.selectedProviderId = "";
   state.verificationToken = "";
   elements.form.reset();
@@ -804,12 +875,16 @@ function newProvider() {
   elements.providerPreset.focus();
 }
 
-function updateProviderType() {
+function updateProviderType({readOnly = false} = {}) {
   const isMock = elements.providerType.value === "mock";
-  elements.remoteFields.hidden = isMock;
-  elements.baseUrl.required = !isMock;
-  elements.discoverModels.disabled = false;
-  elements.discoverModels.textContent = isMock ? "载入离线模型" : "检测并获取模型";
+  elements.remoteFields.hidden = isMock || readOnly;
+  elements.baseUrl.required = !isMock && !readOnly;
+  elements.discoverModels.disabled = readOnly;
+  elements.discoverModels.textContent = readOnly
+    ? "只读配置"
+    : isMock
+      ? "载入离线模型"
+      : "检测并获取模型";
 }
 
 function collectConnectionDraft() {

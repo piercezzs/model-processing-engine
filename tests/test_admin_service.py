@@ -69,6 +69,43 @@ class AdminServiceTests(unittest.TestCase):
             self.assertNotIn("apiKey", config.text)
             self.assertIn("csrfToken", config.json())
 
+    def test_admin_config_accepts_codex_sdk_as_read_only_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings, engine = self._runtime(Path(temp_dir))
+            settings.provider_config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaultProviderId": "codex-local",
+                        "providers": {
+                            "codex-local": {
+                                "type": "codex_sdk",
+                                "defaultModel": "gpt-5.6-sol",
+                                "availableModels": ["gpt-5.6-sol"],
+                                "capabilities": ["structured_json", "web_search"],
+                                "webSearch": "live",
+                                "timeoutSeconds": 0,
+                                "transportRetries": 0,
+                                "maxConcurrency": 1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = TestClient(
+                create_app(engine=engine, settings=settings, restart_scheduler=lambda _settings: None),
+                client=("127.0.0.1", 50000),
+            )
+
+            response = client.get("/v1/admin/config", headers={"Host": "127.0.0.1:8787"})
+
+            self.assertEqual(response.status_code, 200)
+            provider = response.json()["config"]["providers"][0]
+            self.assertEqual(provider["id"], "codex-local")
+            self.assertEqual(provider["type"], "codex_sdk")
+            self.assertFalse(provider["editable"])
+
     def test_admin_mutation_requires_same_origin_and_csrf(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings, engine = self._runtime(Path(temp_dir))
