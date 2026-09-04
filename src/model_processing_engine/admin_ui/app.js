@@ -14,6 +14,7 @@ const state = {
   modelReasoningCapabilities: {},
   modelDiscoveryRequestId: 0,
   verificationToken: "",
+  pendingDeleteProviderId: "",
   historyPeriod: "day",
   historyOffset: 0,
   historyPageSize: 20,
@@ -57,6 +58,14 @@ const elements = {
   resultBox: document.querySelector("#result-box"),
   testProvider: document.querySelector("#test-provider"),
   applyProvider: document.querySelector("#apply-provider"),
+  providerDeleteZone: document.querySelector("#provider-delete-zone"),
+  deleteProviderHelp: document.querySelector("#delete-provider-help"),
+  deleteProvider: document.querySelector("#delete-provider"),
+  deleteProviderDialog: document.querySelector("#delete-provider-dialog"),
+  deleteProviderId: document.querySelector("#delete-provider-id"),
+  deleteProviderStatus: document.querySelector("#delete-provider-status"),
+  cancelDeleteProvider: document.querySelector("#cancel-delete-provider"),
+  confirmDeleteProvider: document.querySelector("#confirm-delete-provider"),
   restartOverlay: document.querySelector("#restart-overlay"),
   restartMessage: document.querySelector("#restart-message"),
   refreshHistory: document.querySelector("#refresh-history"),
@@ -677,6 +686,22 @@ function setProviderFormReadOnly(readOnly) {
     : DEFAULT_SECURITY_NOTICE;
 }
 
+function renderDeleteProviderState(provider) {
+  elements.providerDeleteZone.hidden = false;
+  const isOnlyProvider = state.config.providers.length <= 1;
+  elements.deleteProvider.disabled = provider.active || isOnlyProvider;
+  if (provider.active) {
+    elements.deleteProviderHelp.textContent = "当前激活平台不能删除；请先保存并激活另一个平台。";
+    return;
+  }
+  if (isOnlyProvider) {
+    elements.deleteProviderHelp.textContent = "至少需要保留一个模型平台。";
+    return;
+  }
+  elements.deleteProviderHelp.textContent =
+    "删除配置后会重启 MPE；调用历史和缓存记录会保留。";
+}
+
 function renderProviderPreset(provider) {
   elements.providerPreset.querySelector(`option[value="${READ_ONLY_PRESET}"]`)?.remove();
   if (provider.editable === false) {
@@ -833,6 +858,7 @@ function selectProvider(providerId) {
   } else {
     setResult("修改配置后，请先测试连接。", "neutral");
   }
+  renderDeleteProviderState(provider);
   renderProviderList();
 }
 
@@ -864,6 +890,7 @@ function newProvider() {
   elements.credentialState.textContent = "尚未配置 Key";
   elements.activeBadge.hidden = true;
   elements.editorTitle.textContent = "新增模型平台";
+  elements.providerDeleteZone.hidden = true;
   elements.applyProvider.disabled = true;
   applyPreset("custom", {updateProviderId: true});
   elements.timeoutSeconds.value = "60";
@@ -1026,7 +1053,14 @@ async function applyProvider() {
     state.verificationToken = "";
     elements.restartOverlay.hidden = false;
     elements.restartMessage.textContent = `${payload.providerId} / ${payload.model} 已保存，正在重启 MPE。`;
-    await waitForRestart();
+    const restarted = await waitForRestart({
+      successMessage: "配置已经生效，MPE 服务已恢复。",
+      timeoutMessage: "配置已保存，但服务未在 30 秒内恢复。请运行 start_mpe.command 检查状态。",
+    });
+    if (!restarted) {
+      elements.testProvider.disabled = false;
+      setButtonLoading(elements.applyProvider, false, "");
+    }
   } catch (error) {
     setResult(error.message, "error");
     elements.testProvider.disabled = false;
@@ -1034,7 +1068,49 @@ async function applyProvider() {
   }
 }
 
-async function waitForRestart() {
+function openDeleteProviderDialog() {
+  const provider = state.config.providers.find((item) => item.id === state.selectedProviderId);
+  if (!provider || elements.deleteProvider.disabled) {
+    return;
+  }
+  state.pendingDeleteProviderId = provider.id;
+  elements.deleteProviderId.textContent = provider.id;
+  elements.deleteProviderStatus.textContent = "";
+  elements.cancelDeleteProvider.disabled = false;
+  setButtonLoading(elements.confirmDeleteProvider, false, "");
+  elements.deleteProviderDialog.showModal();
+  elements.cancelDeleteProvider.focus();
+}
+
+async function deleteProvider() {
+  const providerId = state.pendingDeleteProviderId;
+  if (!providerId) {
+    return;
+  }
+  elements.deleteProviderStatus.textContent = "正在删除本地配置…";
+  elements.cancelDeleteProvider.disabled = true;
+  setButtonLoading(elements.confirmDeleteProvider, true, "正在删除…");
+  try {
+    await requestJson(`${API_BASE}/providers/${encodeURIComponent(providerId)}`, {
+      method: "DELETE",
+    });
+    state.pendingDeleteProviderId = "";
+    state.selectedProviderId = "";
+    elements.deleteProviderDialog.close();
+    elements.restartOverlay.hidden = false;
+    elements.restartMessage.textContent = `${providerId} 已删除，正在重启 MPE。`;
+    await waitForRestart({
+      successMessage: `${providerId} 已删除，MPE 服务已恢复。`,
+      timeoutMessage: `${providerId} 已从配置中删除，但服务未在 30 秒内恢复。请运行 start_mpe.command 检查状态。`,
+    });
+  } catch (error) {
+    elements.deleteProviderStatus.textContent = error.message;
+    elements.cancelDeleteProvider.disabled = false;
+    setButtonLoading(elements.confirmDeleteProvider, false, "");
+  }
+}
+
+async function waitForRestart({successMessage, timeoutMessage}) {
   const deadline = Date.now() + 30000;
   await new Promise((resolve) => window.setTimeout(resolve, 700));
   while (Date.now() < deadline) {
@@ -1047,8 +1123,8 @@ async function waitForRestart() {
           await loadHistory();
         }
         elements.restartOverlay.hidden = true;
-        setResult("配置已经生效，MPE 服务已恢复。", "success");
-        return;
+        setResult(successMessage, "success");
+        return true;
       }
     } catch (_error) {
       // A short connection failure is expected while the managed process restarts.
@@ -1056,9 +1132,8 @@ async function waitForRestart() {
     await new Promise((resolve) => window.setTimeout(resolve, 700));
   }
   elements.restartOverlay.hidden = true;
-  elements.testProvider.disabled = false;
-  setButtonLoading(elements.applyProvider, false, "");
-  setResult("配置已保存，但服务未在 30 秒内恢复。请运行 start_mpe.command 检查状态。", "error");
+  setResult(timeoutMessage, "error");
+  return false;
 }
 
 async function loadConfig() {
@@ -1108,6 +1183,22 @@ elements.form.addEventListener("input", invalidateVerification);
 elements.discoverModels.addEventListener("click", discoverModels);
 elements.testProvider.addEventListener("click", testProvider);
 elements.applyProvider.addEventListener("click", applyProvider);
+elements.deleteProvider.addEventListener("click", openDeleteProviderDialog);
+elements.cancelDeleteProvider.addEventListener("click", () => {
+  state.pendingDeleteProviderId = "";
+  elements.deleteProviderDialog.close();
+});
+elements.confirmDeleteProvider.addEventListener("click", deleteProvider);
+elements.deleteProviderDialog.addEventListener("cancel", (event) => {
+  if (elements.cancelDeleteProvider.disabled) {
+    event.preventDefault();
+  }
+});
+elements.deleteProviderDialog.addEventListener("close", () => {
+  if (elements.restartOverlay.hidden) {
+    state.pendingDeleteProviderId = "";
+  }
+});
 elements.toggleKey.addEventListener("click", () => {
   const showing = elements.apiKey.type === "text";
   elements.apiKey.type = showing ? "password" : "text";

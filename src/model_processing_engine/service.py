@@ -32,6 +32,7 @@ from .exceptions import (
     ConfigurationError,
     ContractValidationError,
     ExecutionNotFoundError,
+    ProviderConfigurationNotFoundError,
     ProviderError,
 )
 from .factory import build_default_engine
@@ -374,6 +375,21 @@ def create_app(
             result = admin_manager.apply_provider(request)
         except ConfigurationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        background_tasks.add_task(restart_service_later, runtime)
+        return result
+
+    @app.delete(f"/{API_VERSION}/admin/providers/{{provider_id}}")
+    def admin_delete_provider(
+        provider_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> dict[str, Any]:
+        assert admin_manager is not None
+        try:
+            result = admin_manager.delete_provider(provider_id)
+        except ProviderConfigurationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConfigurationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         background_tasks.add_task(restart_service_later, runtime)
         return result
 

@@ -14,7 +14,12 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from .exceptions import ConfigurationError, ProviderEmptyContentError, ProviderError
+from .exceptions import (
+    ConfigurationError,
+    ProviderConfigurationNotFoundError,
+    ProviderEmptyContentError,
+    ProviderError,
+)
 from .file_store import atomic_write_text
 from .project_environment import read_env_file, update_project_environment
 from .providers import default_provider_factories
@@ -436,6 +441,85 @@ class AdminConfigManager:
                 "providerId": draft.provider_id,
                 "model": model,
                 "reasoningEffort": draft.default_reasoning_effort,
+                "restartRequired": True,
+            }
+
+    def delete_provider(self, provider_id: str) -> dict[str, Any]:
+        normalized_id = provider_id.strip()
+        if not PROVIDER_ID_PATTERN.fullmatch(normalized_id):
+            raise ConfigurationError("providerId contains unsupported characters")
+
+        with self._lock:
+            raw = self._read_provider_config()
+            providers = dict(raw.get("providers") or {})
+            existing_provider = providers.get(normalized_id)
+            if not isinstance(existing_provider, dict):
+                raise ProviderConfigurationNotFoundError(
+                    f"Provider configuration does not exist: {normalized_id}"
+                )
+            default_id = str(raw.get("defaultProviderId") or "")
+            if normalized_id == default_id:
+                raise ConfigurationError(
+                    "The active Provider cannot be deleted; activate another Provider first"
+                )
+            if len(providers) <= 1:
+                raise ConfigurationError("At least one Provider configuration must remain")
+
+            credential_env = str(existing_provider.get("apiKeyEnv") or "").strip()
+            del providers[normalized_id]
+            credential_is_shared = bool(
+                credential_env
+                and any(
+                    isinstance(provider, dict)
+                    and str(provider.get("apiKeyEnv") or "").strip() == credential_env
+                    for provider in providers.values()
+                )
+            )
+            env_values = read_env_file(self.env_path)
+            remove_credential_from_file = bool(
+                credential_env
+                and not credential_is_shared
+                and credential_env in env_values
+            )
+            credential_removed = bool(
+                credential_env
+                and not credential_is_shared
+                and (remove_credential_from_file or credential_env in os.environ)
+            )
+
+            updated = {
+                "version": 1,
+                "defaultProviderId": default_id,
+                "providers": providers,
+            }
+            self._validate_provider_config(updated)
+            serialized = json.dumps(updated, ensure_ascii=False, indent=2) + "\n"
+            if len(serialized.encode("utf-8")) > MAX_PROVIDER_CONFIG_BYTES:
+                raise ConfigurationError("Provider configuration is too large")
+            original_serialized = json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
+            atomic_write_text(self.local_provider_path, serialized, mode=0o600)
+            try:
+                if remove_credential_from_file:
+                    update_project_environment(
+                        self.project_dir,
+                        {},
+                        removals=(credential_env,),
+                    )
+            except Exception:
+                atomic_write_text(
+                    self.local_provider_path,
+                    original_serialized,
+                    mode=0o600,
+                )
+                raise
+
+            if credential_removed:
+                os.environ.pop(credential_env, None)
+            self._verified.clear()
+            return {
+                "status": "deleted",
+                "providerId": normalized_id,
+                "credentialRemoved": credential_removed,
                 "restartRequired": True,
             }
 

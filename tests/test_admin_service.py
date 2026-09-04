@@ -131,6 +131,81 @@ class AdminServiceTests(unittest.TestCase):
                 200,
             )
 
+    def test_admin_delete_requires_csrf_protects_active_and_schedules_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            settings, engine = self._runtime(Path(temp_dir))
+            settings.provider_config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaultProviderId": "mock",
+                        "providers": {
+                            "mock": {"type": "mock", "defaultModel": "schema-sample-v1"},
+                            "unused": {
+                                "type": "openai_compatible",
+                                "baseUrl": "https://models.example/v1",
+                                "apiKeyEnv": "MPE_PROVIDER_UNUSED_API_KEY",
+                                "defaultModel": "model-one",
+                                "availableModels": ["model-one"],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (settings.project_dir / ".env").write_text(
+                'MPE_PROVIDER_UNUSED_API_KEY="file-secret"\n',
+                encoding="utf-8",
+            )
+            scheduled: list[Settings] = []
+            client = TestClient(
+                create_app(
+                    engine=engine,
+                    settings=settings,
+                    restart_scheduler=scheduled.append,
+                ),
+                client=("127.0.0.1", 50000),
+            )
+            headers = {"Host": "127.0.0.1:8787"}
+
+            self.assertEqual(
+                client.delete("/v1/admin/providers/unused", headers=headers).status_code,
+                403,
+            )
+            csrf = client.get("/v1/admin/config", headers=headers).json()["csrfToken"]
+            mutation_headers = {
+                **headers,
+                "Origin": "http://127.0.0.1:8787",
+                "X-MPE-CSRF": csrf,
+            }
+            self.assertEqual(
+                client.delete("/v1/admin/providers/mock", headers=mutation_headers).status_code,
+                409,
+            )
+            self.assertEqual(
+                client.delete("/v1/admin/providers/missing", headers=mutation_headers).status_code,
+                404,
+            )
+
+            deleted = client.delete(
+                "/v1/admin/providers/unused",
+                headers=mutation_headers,
+            )
+
+            self.assertEqual(deleted.status_code, 200)
+            self.assertEqual(deleted.json()["status"], "deleted")
+            self.assertEqual(scheduled, [settings])
+            local = json.loads(
+                (settings.project_dir / "config" / "providers.local.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotIn("unused", local["providers"])
+            self.assertNotIn(
+                "MPE_PROVIDER_UNUSED_API_KEY",
+                (settings.project_dir / ".env").read_text(encoding="utf-8"),
+            )
+
     def test_verified_apply_schedules_restart_and_writes_project_env(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
             settings, engine = self._runtime(Path(temp_dir))

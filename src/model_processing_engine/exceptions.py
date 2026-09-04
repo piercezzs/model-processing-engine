@@ -46,6 +46,10 @@ class ConfigurationError(ModelProcessingError):
     """Local runtime configuration is invalid or incomplete."""
 
 
+class ProviderConfigurationNotFoundError(ConfigurationError):
+    """A requested local Provider configuration does not exist."""
+
+
 class ExecutionNotFoundError(ModelProcessingError):
     """An execution record does not exist."""
 

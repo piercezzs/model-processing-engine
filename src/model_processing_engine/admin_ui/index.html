@@ -167,6 +167,14 @@
             <button class="primary-button" id="apply-provider" type="button" disabled>保存并激活</button>
           </div>
         </form>
+
+        <div class="provider-delete-zone" id="provider-delete-zone" hidden>
+          <div>
+            <strong>删除模型平台</strong>
+            <small id="delete-provider-help">删除配置后会重启 MPE；调用历史和缓存记录会保留。</small>
+          </div>
+          <button class="danger-button" id="delete-provider" type="button">删除此平台</button>
+        </div>
       </section>
     </main>
 
@@ -313,6 +321,27 @@
       </section>
     </section>
   </div>
+
+  <dialog
+    class="confirmation-dialog"
+    id="delete-provider-dialog"
+    aria-labelledby="delete-provider-title"
+    aria-describedby="delete-provider-description"
+  >
+    <div class="confirmation-card">
+      <p class="section-label">DELETE PROVIDER</p>
+      <h2 id="delete-provider-title">删除模型平台？</h2>
+      <p id="delete-provider-description">
+        将删除 <code id="delete-provider-id"></code> 的本地配置，并在其凭证未被其他平台共用时清理对应 Key。
+        调用历史与缓存记录不会删除。
+      </p>
+      <p class="dialog-status" id="delete-provider-status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button class="secondary-button" id="cancel-delete-provider" type="button">取消</button>
+        <button class="danger-button" id="confirm-delete-provider" type="button">删除并重启</button>
+      </div>
+    </div>
+  </dialog>
 
   <div class="restart-overlay" id="restart-overlay" hidden>
     <div class="restart-card">

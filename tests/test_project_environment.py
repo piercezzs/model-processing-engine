@@ -78,6 +78,35 @@ class ProjectEnvironmentTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError):
                 read_env_file(project / ".env")
 
+    def test_update_can_remove_an_allowlisted_key_without_touching_other_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = self._project(Path(temp_dir))
+            (project / ".env").write_text(
+                '# local settings\nMPE_PORT=8787\nMPE_PROVIDER_UNUSED_API_KEY="secret"\n',
+                encoding="utf-8",
+            )
+
+            values = update_project_environment(
+                project,
+                {},
+                removals=("MPE_PROVIDER_UNUSED_API_KEY",),
+            )
+
+            self.assertEqual(values, {"MPE_PORT": "8787"})
+            content = (project / ".env").read_text(encoding="utf-8")
+            self.assertIn("# local settings", content)
+            self.assertNotIn("MPE_PROVIDER_UNUSED_API_KEY", content)
+
+    def test_update_rejects_overlapping_update_and_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = self._project(Path(temp_dir))
+            with self.assertRaisesRegex(ConfigurationError, "updated and removed"):
+                update_project_environment(
+                    project,
+                    {"MPE_PORT": "8787"},
+                    removals=("MPE_PORT",),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

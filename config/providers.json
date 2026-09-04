@@ -10,20 +10,6 @@
       "maxConcurrency": 8,
       "availableModels": ["schema-sample-v1"],
       "capabilities": ["structured_json", "text_stream"]
-    },
-    "openai-compatible": {
-      "type": "openai_compatible",
-      "baseUrl": "https://api.openai.com/v1",
-      "chatCompletionsPath": "/chat/completions",
-      "apiKeyEnv": "MPE_AI_API_KEY",
-      "defaultModel": "",
-      "defaultReasoningEffort": "auto",
-      "timeoutSeconds": 60,
-      "transportRetries": 2,
-      "maxConcurrency": 8,
-      "cacheIdentity": "account-and-endpoint-v1",
-      "availableModels": [],
-      "capabilities": ["structured_json", "text_stream"]
     }
   }
 }

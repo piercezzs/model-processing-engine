@@ -144,13 +144,18 @@ MPE 会先在内存中测试准确的 Provider 配置、模型列表、默认模
 显示是否已配置凭证。保存完成后，MPE 会安排一次经过身份验证的托管重启，页面会
 等待新服务恢复健康。连接测试失败不会修改这两个文件。
 
+非当前激活的 Provider 可以从配置面板删除。删除操作会保留执行历史和结果缓存记录，
+清理未被其他 Provider 共用的本地凭证，并重启 MPE。当前激活 Provider 和最后一个
+Provider 不能删除。
+
 通过平台启动脚本启动 MPE 时，项目 `.env` 会被自动载入。当前进程已有的环境变量
 优先级更高，因此无界面和 CI 部署仍可覆盖配置。不要提交、复制或分享项目 `.env`
 文件。
 
-内置默认 Provider 是确定性的 `mock`，因此无需网络和凭证也能运行仓库。真实调用
-前，请将 `config/providers.json` 复制到你的部署配置中，并设置
-`MPE_PROVIDER_CONFIG`。
+内置默认 Provider 是确定性的 `mock`，因此无需网络和凭证也能运行仓库，并且不会
+把未配置的远程 Provider 占位项带入本地状态。需要手工管理 OpenAI-compatible 配置
+时，请从 `examples/providers.openai.json` 开始，设置模型和凭证环境变量，再将
+`MPE_PROVIDER_CONFIG` 指向得到的本地文件。
 
 `MPE_HOME` 默认是 `~/.model-processing-engine`。除非分别覆盖路径，托管服务的
 数据、日志和进程记录都会存放在该稳定目录下。显式指定 `--root` 可以选择独立的
@@ -188,8 +193,8 @@ tasks/example/
     "sensitive": false
   },
   "runtimeDefaults": {
-    "providerId": "openai-compatible",
-    "model": "your-model-id",
+    "providerId": "mock",
+    "model": "schema-sample-v1",
     "temperature": 0.1,
     "contractRetries": 1
   }
@@ -344,6 +349,7 @@ ID；无法验证的活动 PID 永远不会被终止。
 - `POST /v1/admin/providers/test`（受同源和 CSRF 保护）
 - `POST /v1/admin/providers/models`（在内存中获取 Provider 模型列表）
 - `POST /v1/admin/providers/apply`（受同源和 CSRF 保护）
+- `DELETE /v1/admin/providers/{provider_id}`（仅限非活动 Provider；受同源和 CSRF 保护）
 
 HTTP 请求包含解析后的 `TaskDefinition` 和输入数据，不包含服务器端 Task 目录
 路径，从而保持文件系统归调用项目所有。将 `asyncMode` 设置为 `true` 后，会先
@@ -383,7 +389,9 @@ at-least-once；已经存在终态快照的任务不会再次执行。多个可�
 
 ## Provider 配置
 
-`config/providers.json` 展示了支持的 Provider 类型：
+`config/providers.json` 是只包含 `mock` 的安全离线默认配置。
+`examples/providers.openai.json` 和 `examples/providers.codex.json` 提供手工管理的
+起始示例。当前支持的 Provider 类型包括：
 
 - `mock`：根据 Schema 生成确定性结果，用于测试和集成配置。
 - `openai_compatible`：使用 JSON 和纯文本 SSE Chat Completions 传输，并对限流、

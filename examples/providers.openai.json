@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "defaultProviderId": "openai-compatible",
+  "providers": {
+    "openai-compatible": {
+      "type": "openai_compatible",
+      "baseUrl": "https://api.openai.com/v1",
+      "chatCompletionsPath": "/chat/completions",
+      "modelsPath": "/models",
+      "apiKeyEnv": "MPE_AI_API_KEY",
+      "defaultModel": "your-model-id",
+      "defaultReasoningEffort": "auto",
+      "timeoutSeconds": 60,
+      "transportRetries": 2,
+      "maxConcurrency": 8,
+      "cacheIdentity": "account-and-endpoint-v1",
+      "availableModels": ["your-model-id"],
+      "capabilities": ["structured_json", "text_stream"]
+    }
+  }
+}

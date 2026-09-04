@@ -15,6 +15,7 @@ from model_processing_engine.admin_config import (
 )
 from model_processing_engine.exceptions import (
     ConfigurationError,
+    ProviderConfigurationNotFoundError,
     ProviderEmptyContentError,
     ProviderError,
 )
@@ -455,6 +456,138 @@ class AdminConfigManagerTests(unittest.TestCase):
             )
 
             self.assertEqual(os.environ["MPE_PORT"], "9998")
+
+    def test_delete_inactive_provider_removes_its_unshared_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"MPE_PROVIDER_UNUSED_API_KEY": "process-secret"},
+            clear=True,
+        ):
+            project = self._project(Path(temp_dir))
+            config_path = project / "config" / "providers.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaultProviderId": "mock",
+                        "providers": {
+                            "mock": {"type": "mock", "defaultModel": "schema-sample-v1"},
+                            "unused": {
+                                "type": "openai_compatible",
+                                "baseUrl": "https://models.example/v1",
+                                "apiKeyEnv": "MPE_PROVIDER_UNUSED_API_KEY",
+                                "defaultModel": "model-one",
+                                "availableModels": ["model-one"],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (project / ".env").write_text(
+                'MPE_PORT="8787"\nMPE_PROVIDER_UNUSED_API_KEY="file-secret"\n',
+                encoding="utf-8",
+            )
+            manager = AdminConfigManager(project)
+
+            result = manager.delete_provider("unused")
+
+            self.assertEqual(result["status"], "deleted")
+            self.assertTrue(result["credentialRemoved"])
+            local = json.loads(
+                (project / "config" / "providers.local.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(list(local["providers"]), ["mock"])
+            self.assertNotIn("MPE_PROVIDER_UNUSED_API_KEY", (project / ".env").read_text())
+            self.assertNotIn("MPE_PROVIDER_UNUSED_API_KEY", os.environ)
+
+    def test_delete_preserves_a_credential_shared_by_another_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            project = self._project(Path(temp_dir))
+            config_path = project / "config" / "providers.json"
+            shared_provider = {
+                "type": "openai_compatible",
+                "baseUrl": "https://models.example/v1",
+                "apiKeyEnv": "MPE_PROVIDER_SHARED_API_KEY",
+                "defaultModel": "model-one",
+                "availableModels": ["model-one"],
+            }
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaultProviderId": "mock",
+                        "providers": {
+                            "mock": {"type": "mock", "defaultModel": "schema-sample-v1"},
+                            "shared-a": shared_provider,
+                            "shared-b": shared_provider,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (project / ".env").write_text(
+                'MPE_PROVIDER_SHARED_API_KEY="file-secret"\n',
+                encoding="utf-8",
+            )
+            manager = AdminConfigManager(project)
+
+            result = manager.delete_provider("shared-a")
+
+            self.assertFalse(result["credentialRemoved"])
+            self.assertIn(
+                "MPE_PROVIDER_SHARED_API_KEY",
+                (project / ".env").read_text(encoding="utf-8"),
+            )
+
+    def test_delete_rejects_active_or_unknown_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = AdminConfigManager(self._project(Path(temp_dir)))
+
+            with self.assertRaisesRegex(ConfigurationError, "active Provider"):
+                manager.delete_provider("mock")
+            with self.assertRaises(ProviderConfigurationNotFoundError):
+                manager.delete_provider("missing")
+
+    def test_delete_rolls_back_provider_config_when_credential_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = self._project(Path(temp_dir))
+            config_path = project / "config" / "providers.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaultProviderId": "mock",
+                        "providers": {
+                            "mock": {"type": "mock", "defaultModel": "schema-sample-v1"},
+                            "unused": {
+                                "type": "openai_compatible",
+                                "baseUrl": "https://models.example/v1",
+                                "apiKeyEnv": "MPE_PROVIDER_UNUSED_API_KEY",
+                                "defaultModel": "model-one",
+                                "availableModels": ["model-one"],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (project / ".env").write_text(
+                'MPE_PROVIDER_UNUSED_API_KEY="file-secret"\n',
+                encoding="utf-8",
+            )
+            manager = AdminConfigManager(project)
+
+            with patch(
+                "model_processing_engine.admin_config.update_project_environment",
+                side_effect=ConfigurationError("environment write failed"),
+            ), self.assertRaisesRegex(ConfigurationError, "environment write failed"):
+                manager.delete_provider("unused")
+
+            local = json.loads(
+                (project / "config" / "providers.local.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("unused", local["providers"])
 
 
 if __name__ == "__main__":

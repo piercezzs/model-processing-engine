@@ -179,14 +179,22 @@ is configured. After saving, MPE schedules a verified managed restart and the
 page waits for the new service health response. A failed connection test does
 not modify either file.
 
+An inactive Provider can be deleted from its configuration panel. Deletion
+keeps execution history and result-cache records, removes an unshared local
+credential, and restarts MPE. The active Provider and the last remaining
+Provider are protected from deletion.
+
 The project `.env` is loaded automatically when MPE starts through the platform
 wrapper. Existing process environment variables take precedence, which keeps
 headless and CI deployment overrides available. Do not commit, copy, or share
 the project `.env` file.
 
 The bundled default provider is deterministic `mock`; it makes the repository
-runnable without network access or credentials. Copy `config/providers.json` to
-your deployment configuration and set `MPE_PROVIDER_CONFIG` before real calls.
+runnable without network access or credentials and does not seed placeholder
+remote Providers into local state. For a manually managed OpenAI-compatible
+configuration, start from `examples/providers.openai.json`, set its model and
+credential environment, and point `MPE_PROVIDER_CONFIG` to the resulting local
+file.
 
 `MPE_HOME` defaults to `~/.model-processing-engine`. Managed-service data, logs,
 and process records live below that stable root unless their individual paths
@@ -224,8 +232,8 @@ tasks/example/
     "sensitive": false
   },
   "runtimeDefaults": {
-    "providerId": "openai-compatible",
-    "model": "your-model-id",
+    "providerId": "mock",
+    "model": "schema-sample-v1",
     "temperature": 0.1,
     "reasoningEffort": "auto",
     "contractRetries": 1
@@ -401,6 +409,7 @@ Available routes:
 - `POST /v1/admin/providers/test` (same-origin and CSRF protected)
 - `POST /v1/admin/providers/models` (in-memory Provider model discovery)
 - `POST /v1/admin/providers/apply` (same-origin and CSRF protected)
+- `DELETE /v1/admin/providers/{provider_id}` (inactive Providers only; same-origin and CSRF protected)
 
 HTTP requests contain the resolved `TaskDefinition` and input data, never a
 server-side task directory path. This keeps filesystem ownership with the
@@ -448,7 +457,9 @@ ID, and process ID so local service management can verify process identity.
 
 ## Provider configuration
 
-`config/providers.json` shows the supported provider types:
+`config/providers.json` is the safe offline default and contains only `mock`.
+`examples/providers.openai.json` and `examples/providers.codex.json` provide
+manually managed starting points. The supported Provider types are:
 
 - `mock`: deterministic schema-derived output for tests and integration setup.
 - `openai_compatible`: JSON and plain-text SSE chat-completions transport with

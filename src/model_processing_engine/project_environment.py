@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from .exceptions import ConfigurationError
 from .file_store import atomic_write_text
@@ -70,13 +70,27 @@ def read_env_file(path: str | Path) -> dict[str, str]:
     return _parse_lines(lines, label=str(target))
 
 
-def update_project_environment(project_dir: Path, updates: Mapping[str, str]) -> dict[str, str]:
+def update_project_environment(
+    project_dir: Path,
+    updates: Mapping[str, str],
+    *,
+    removals: Iterable[str] = (),
+) -> dict[str, str]:
     target = project_dir / ".env"
+    removal_keys = set(removals)
     for key, value in updates.items():
         if not ENV_KEY_PATTERN.fullmatch(key) or not key.startswith("MPE_"):
             raise ConfigurationError(f"Unsupported MPE environment key: {key}")
         if not isinstance(value, str) or len(value) > 16_384:
             raise ConfigurationError(f"Invalid environment value for {key}")
+    for key in removal_keys:
+        if not ENV_KEY_PATTERN.fullmatch(key) or not key.startswith("MPE_"):
+            raise ConfigurationError(f"Unsupported MPE environment key: {key}")
+    overlap = removal_keys.intersection(updates)
+    if overlap:
+        raise ConfigurationError(
+            f"Environment keys cannot be updated and removed together: {sorted(overlap)[0]}"
+        )
 
     existing_lines: list[str] = []
     if target.exists():
@@ -94,6 +108,8 @@ def update_project_environment(project_dir: Path, updates: Mapping[str, str]) ->
     rendered: list[str] = []
     for line in existing_lines:
         match = ASSIGNMENT_PATTERN.match(line.strip())
+        if match and match.group(1) in removal_keys:
+            continue
         if match and match.group(1) in remaining:
             key = match.group(1)
             rendered.append(_assignment(key, remaining.pop(key)))
