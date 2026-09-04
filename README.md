@@ -19,16 +19,29 @@ progress, usage reporting, execution records, and disposable result caching.
 
 It can be used as a Python library, a CLI, or a versioned local HTTP service.
 
+When run as a local HTTP service, MPE can be shared by multiple trusted tools
+on the same host through their own adapters and Task Packs. Those tools do not
+need to reimplement Provider calls, transport retries, Schema validation,
+concurrency control, execution records, or result-cache infrastructure; they
+continue to own prompts, schemas, cache policy, business review, and durable
+persistence.
+
 ## Boundary
 
-```text
-calling project
-  -> project-owned adapter and Task Pack
-  -> MPE execution contract
-  -> configured model provider
-  -> validated ResultEnvelope
-  -> project-owned review and durable persistence
+```mermaid
+flowchart LR
+    A["Local tool A"] --> T["Tool-owned adapters<br/>and Task Packs"]
+    B["Local tool B"] --> T
+    C["Local tool C"] --> T
+    T --> M["MPE<br/>unified task execution"]
+    M -->|Provider request| P["Configured model Providers"]
+    P -->|model output| M
+    M --> R["Validated ResultEnvelope"]
+    R --> O["Tool-owned review<br/>and durable persistence"]
 ```
+
+*Figure 1: Multiple trusted local tools share one MPE service while retaining
+their own business UI, task definitions, review rules, and authoritative data.*
 
 MPE does not contain caller Jobs, media types, report formats, writeback rules,
 or domain prompts. A book parser, financial classifier, or future media task is
@@ -114,6 +127,20 @@ configuration:
 ```text
 http://127.0.0.1:8787/admin
 ```
+
+### Management-page preview
+
+![MPE Provider management page showing multiple Providers, active state, and the DeepSeek configuration form](docs/images/admin-provider-configuration.png)
+
+*Figure 2: The Provider page presents local platforms, models, and connection
+configuration in one place. Existing API keys are represented only by their
+configuration state and are never returned or displayed in plaintext.*
+
+![MPE execution-history page showing execution statistics, Token cache breakdown, trends, and per-model data](docs/images/admin-execution-history.png)
+
+*Figure 3: Redacted execution history reports task volume, Provider calls,
+Tokens, caching, retries, and per-model statistics without including model
+result bodies.*
 
 The page separates Provider configuration and redacted execution history into
 top-level tabs. Execution history supports day, month, and year periods in the

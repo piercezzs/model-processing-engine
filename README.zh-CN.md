@@ -17,16 +17,27 @@ Provider 调用、重试、校验、并发、进度、用量统计、执行记�
 
 MPE 可以作为 Python 库、CLI 或带版本号的本地 HTTP 服务使用。
 
+以本地 HTTP 服务运行时，多个可信的本机工具可以通过各自的适配器和 Task Pack，
+共享同一套结构化模型任务执行能力。它们无需分别实现 Provider 调用、传输重试、
+按 Schema 校验、并发控制、执行记录和结果缓存基础设施；提示词、Schema、缓存策略、
+业务审核与持久化仍由各工具负责。
+
 ## 边界
 
-```text
-调用项目
-  -> 项目自有适配器和 Task Pack
-  -> MPE 执行契约
-  -> 已配置的模型 Provider
-  -> 经过校验的 ResultEnvelope
-  -> 项目自有审核与持久化
+```mermaid
+flowchart LR
+    A["本机工具 A"] --> T["各工具自有适配器<br/>与 Task Pack"]
+    B["本机工具 B"] --> T
+    C["本机工具 C"] --> T
+    T --> M["MPE<br/>统一任务执行"]
+    M -->|Provider 请求| P["已配置的模型 Provider"]
+    P -->|模型输出| M
+    M --> R["经过校验的 ResultEnvelope"]
+    R --> O["各工具自有审核<br/>与持久化"]
 ```
+
+*图 1：多个可信的本机工具共享同一个 MPE 服务；调用工具仍保留自己的业务界面、
+任务定义、审核规则和权威数据。*
 
 MPE 不包含调用项目的 Job、媒体类型、报告格式、回写规则或领域提示词。图书解析器、
 金融分类器或未来的媒体任务，都由调用项目定义，并通过相同契约提交。
@@ -100,6 +111,18 @@ JSON 服务状态，而不重复执行依赖校验；也可以组合使用 `--st
 ```text
 http://127.0.0.1:8787/admin
 ```
+
+### 管理页面预览
+
+![MPE Provider 管理页面，展示多个 Provider、活动状态和 DeepSeek 配置表单](docs/images/admin-provider-configuration.png)
+
+*图 2：Provider 管理页统一展示本机平台、模型与连接配置；已有 API Key 只显示配置
+状态，不返回或展示凭证明文。*
+
+![MPE 模型调用记录页面，展示执行统计、Token 缓存拆分、趋势和逐模型数据](docs/images/admin-execution-history.png)
+
+*图 3：脱敏后的执行历史展示任务量、Provider 调用、Token、缓存、重试与逐模型统计，
+但不包含模型结果正文。*
 
 页面使用顶层标签页区分 Provider 配置和脱敏后的执行历史。执行历史支持按照浏览器
 所在 IANA 时区查看日、月、年周期，并可按正式任务/连接测试、Provider 和模型进行
